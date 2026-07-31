@@ -86,6 +86,13 @@ Every table function resolves a secret by name (`secret := 'my_loki'`) or falls 
 the default `loki` secret. Individual connection fields may also be overridden inline for
 ad-hoc use.
 
+The fallback lookup passes the endpoint the call names (`endpoint := ...`, or an ATTACH
+`http(s)://` path) as the Secret Manager path, so a secret's `SCOPE` bounds which endpoints
+its credentials can reach — the same protection `httpfs` relies on. Looking up with an empty
+path instead would both discard every scoped secret (`BaseSecret::MatchScore` scores a
+non-matching prefix `INT64_MIN`) and attach an unscoped secret's token/tenant to whatever
+host the query named. Unscoped secrets keep matching any endpoint at score 0.
+
 For CI/container use, the `env` provider seeds the secret from the standard `logcli`
 environment variables (the Loki analog of libpq's `PG*`) — `LOKI_ADDR` → endpoint,
 `LOKI_BEARER_TOKEN` → token, `LOKI_USERNAME`/`LOKI_PASSWORD` → basic auth, `LOKI_ORG_ID` →

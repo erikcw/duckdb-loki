@@ -55,11 +55,21 @@ struct LokiScanGlobalState : public GlobalTableFunctionState {
 	}
 };
 
-// Convert a bound timestamp value to an exact nanosecond epoch (no microsecond rounding),
-// used for pushed-down WHERE bounds where the column itself is TIMESTAMP_NS.
-int64_t ValueToEpochNsExact(const Value &value) {
-	Value as_ns = value.DefaultCastAs(LogicalType::TIMESTAMP_NS);
-	return as_ns.GetValueUnsafe<int64_t>();
+// Convert a bound timestamp value to an exact nanosecond epoch (no microsecond rounding), used
+// for pushed-down WHERE bounds where the column itself is TIMESTAMP_NS. Non-throwing on purpose:
+// pushdown_complex_filter must never abort a query over a predicate it merely declines to
+// translate, and declining costs nothing here because timestamp predicates always stay residual
+// for DuckDB to apply exactly. (A constant outside the nanosecond range — ~1677..2262 — is today
+// rejected by DuckDB's own comparison binding before it reaches us; this keeps that from being
+// load-bearing.)
+bool TryValueToEpochNsExact(const Value &value, int64_t &out) {
+	Value as_ns;
+	string error;
+	if (!value.DefaultTryCastAs(LogicalType::TIMESTAMP_NS, as_ns, &error) || as_ns.IsNull()) {
+		return false;
+	}
+	out = as_ns.GetValueUnsafe<int64_t>();
+	return true;
 }
 
 // Shared bind work for loki_scan (raw) and loki (pushdown): resolve the connection/auth from a
@@ -105,7 +115,15 @@ void LokiResolveCommon(ClientContext &context, TableFunctionBindInput &input, Lo
 			if (child.IsNull()) {
 				throw BinderException("%s 'labels' must not contain NULL entries", fn);
 			}
-			result.label_columns.push_back(child.ToString());
+			std::string label = child.ToString();
+			// Label names are concatenated into the LogQL selector verbatim (LogQL has no escaping
+			// for them), so anything outside the label grammar could inject matchers or filters.
+			if (!loki::IsValidLabelName(label)) {
+				throw BinderException("%s: invalid label name '%s' in 'labels'; label names must match "
+				                      "[a-zA-Z_][a-zA-Z0-9_]*",
+				                      fn, label);
+			}
+			result.label_columns.push_back(std::move(label));
 		}
 	}
 
@@ -148,6 +166,14 @@ unique_ptr<FunctionData> LokiBind(ClientContext &context, TableFunctionBindInput
 	// the mandatory-selector rule is enforced at scan start once pushdown has run.
 	if (auto *p = FindNamedParam(input, "selector")) {
 		result->base_selector = p->ToString();
+		// BuildSelectorQuery keeps only the brace contents plus the trailing pipeline, so any text
+		// before the `{` would be dropped without a word — changing the user's query silently.
+		std::string prefix = loki::SelectorPrefixBeforeBrace(result->base_selector);
+		if (!prefix.empty()) {
+			throw BinderException("loki: unexpected text '%s' before the stream selector's '{' — pass the selector "
+			                      "on its own, e.g. selector := '{job=\"api\"}'",
+			                      prefix);
+		}
 	}
 
 	LokiResolveCommon(context, input, *result, return_types, names, "loki");
@@ -228,8 +254,14 @@ bool TryComparison(ClientContext &context, const LogicalGet &get, LokiScanBindDa
 	if (col_name == "timestamp") {
 		// Coarse time-window bound: push it to Loki, but keep the predicate residual so DuckDB
 		// applies it exactly (guards against any boundary/inclusivity mismatch). Loki's `end` is
-		// exclusive, so an upper bound is nudged +1ns to keep the window a superset.
-		int64_t ns = ValueToEpochNsExact(constant);
+		// exclusive, so an upper bound is nudged +1ns to keep the window a superset — skipped at
+		// the maximum representable instant, where `ns + 1` would overflow (UB) into an inverted
+		// window and where the bound cannot narrow anything anyway.
+		int64_t ns;
+		if (!TryValueToEpochNsExact(constant, ns)) {
+			return false; // out of nanosecond range: push nothing, leave it entirely to DuckDB
+		}
+		const bool exclusive_end_representable = ns != std::numeric_limits<int64_t>::max();
 		switch (op) {
 		case ExpressionType::COMPARE_GREATERTHAN:
 		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
@@ -239,11 +271,17 @@ bool TryComparison(ClientContext &context, const LogicalGet &get, LokiScanBindDa
 			AddEndBound(bind_data, ns);
 			break;
 		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-			AddEndBound(bind_data, ns + 1);
+			if (exclusive_end_representable) {
+				AddEndBound(bind_data, ns + 1);
+			}
 			break;
 		case ExpressionType::COMPARE_EQUAL:
-			AddStartBound(bind_data, ns);
-			AddEndBound(bind_data, ns + 1);
+			// A single-instant window [ns, ns+1): push it only if both ends are representable, so
+			// the start bound is never pushed without its matching end.
+			if (exclusive_end_representable) {
+				AddStartBound(bind_data, ns);
+				AddEndBound(bind_data, ns + 1);
+			}
 			break;
 		default:
 			break;
@@ -496,7 +534,7 @@ void LokiScanFunction(ClientContext &context, TableFunctionInput &data_p, DataCh
 			}
 			if (response.status < 200 || response.status >= 300) {
 				throw IOException(StringUtil::Format("loki_scan: Loki returned HTTP %d: %s", response.status,
-				                                     response.body.substr(0, 1000)));
+				                                     loki::ResponseSnippet(response.body, 1000)));
 			}
 			// ParseStreamsResponse throws std::runtime_error on malformed/non-streams bodies.
 			auto chunks = loki::ParseStreamsResponse(response.body);
@@ -513,7 +551,11 @@ void LokiScanFunction(ClientContext &context, TableFunctionInput &data_p, DataCh
 		for (idx_t out = 0; out < state.column_ids.size(); out++) {
 			const column_t src = state.column_ids[out];
 			if (src == COLUMN_IDENTIFIER_ROW_ID || IsVirtualColumn(src)) {
-				continue; // we emit no row-ids or virtual columns
+				// We emit no row-ids or virtual columns. Write a NULL rather than skipping: the row
+				// is still counted by SetCardinality, so leaving the slot untouched would hand back
+				// an uninitialized flat-vector entry (a garbage string_t for a VARCHAR column).
+				FlatVector::SetNull(output.data[out], count, true);
+				continue;
 			}
 			auto &vec = output.data[out];
 			if (src == 0) {

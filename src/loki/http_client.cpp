@@ -15,7 +15,12 @@ HttpResponse HttpGet(const std::string &endpoint, const std::string &path, const
 	httplib::Client client(endpoint);
 	client.set_connection_timeout(10, 0); // 10s
 	client.set_read_timeout(60, 0);       // 60s
-	client.set_follow_location(true);
+	// Redirects are deliberately NOT followed. Loki's read API never needs them, and cpp-httplib
+	// re-issues the request with our tenant header (X-Scope-OrgID) and any `headers :=` / secret
+	// headers — where Grafana Cloud and reverse-proxy API keys live — still attached, to whatever
+	// host the Location says, downgrading https to http if it asks. Only Authorization/Cookie are
+	// stripped, and only by recent httplib versions, so following would make credential safety a
+	// property of the resolved dependency version rather than of this code.
 
 	httplib::Headers header_map;
 	for (const auto &header : headers) {

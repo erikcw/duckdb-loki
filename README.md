@@ -84,6 +84,21 @@ ORDER BY timestamp;
 
 A secret named `loki` is used automatically when `secret :=` is omitted.
 
+**Scoping.** When `secret :=` is omitted, the secret is looked up against the endpoint the
+query actually names, so `SCOPE` restricts where its credentials may travel:
+
+```sql
+CREATE SECRET internal_loki (
+    TYPE loki, ENDPOINT 'https://logs.internal.example', TOKEN 'glc_...',
+    SCOPE 'https://logs.internal.example'
+);
+-- This token is now only ever sent to https://logs.internal.example…; a query naming any
+-- other endpoint resolves without it.
+```
+
+A secret created without a `SCOPE` still matches every endpoint (that is what makes an
+unscoped default secret convenient) — scope the ones whose credentials matter.
+
 **From the environment.** For CI and containers where you'd rather not hard-code credentials,
 the `env` provider seeds the secret from the standard [`logcli`](https://grafana.com/docs/loki/latest/query/logcli/)
 variables — the Loki analog of libpq's `PG*`:

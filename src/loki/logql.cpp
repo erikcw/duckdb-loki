@@ -59,6 +59,32 @@ std::string LineFilterToString(const LineFilter &f) {
 
 } // namespace
 
+bool IsValidLabelName(const std::string &name) {
+	if (name.empty()) {
+		return false;
+	}
+	char first = name[0];
+	if (!((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || first == '_')) {
+		return false;
+	}
+	for (size_t i = 1; i < name.size(); i++) {
+		char c = name[i];
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) {
+			return false;
+		}
+	}
+	return true;
+}
+
+std::string SelectorPrefixBeforeBrace(const std::string &selector) {
+	std::string trimmed = Trim(selector);
+	size_t open = trimmed.find('{');
+	if (open == std::string::npos) {
+		return std::string();
+	}
+	return Trim(trimmed.substr(0, open));
+}
+
 std::string EscapeLogQLString(const std::string &value) {
 	std::string out;
 	out.reserve(value.size() + 2);

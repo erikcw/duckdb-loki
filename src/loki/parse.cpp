@@ -10,10 +10,9 @@ namespace loki {
 
 namespace {
 
-// Truncated view of a response body, for embedding in error messages.
+// Shorthand for the default-length sanitized snippet used throughout this file.
 std::string Snippet(const std::string &body) {
-	static constexpr size_t MAX = 500;
-	return body.size() > MAX ? body.substr(0, MAX) + "..." : body;
+	return ResponseSnippet(body);
 }
 
 // RAII guard so the yyjson document is freed on every exit path.
@@ -27,6 +26,28 @@ struct DocGuard {
 };
 
 } // namespace
+
+std::string ResponseSnippet(const std::string &body, size_t max_bytes) {
+	const size_t take = body.size() > max_bytes ? max_bytes : body.size();
+	std::string out;
+	out.reserve(take + 3);
+	for (size_t i = 0; i < take; i++) {
+		const unsigned char c = static_cast<unsigned char>(body[i]);
+		if (c >= 0x20 && c < 0x7f) {
+			out.push_back(static_cast<char>(c));
+		} else if (c == '\t' || c == '\n' || c == '\r') {
+			out.push_back(' ');
+		} else {
+			// A control byte, or a non-ASCII byte that the byte-offset cut may have sliced out of a
+			// multi-byte codepoint: replace it so the message stays printable and valid UTF-8.
+			out.push_back('?');
+		}
+	}
+	if (body.size() > take) {
+		out += "...";
+	}
+	return out;
+}
 
 std::vector<std::string> ParseStringArrayResponse(const std::string &json) {
 	yyjson_doc *doc = yyjson_read(json.c_str(), json.size(), 0);

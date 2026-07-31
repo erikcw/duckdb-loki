@@ -4,11 +4,13 @@
 
 using duckdb::loki::BuildSelectorQuery;
 using duckdb::loki::EscapeLogQLString;
+using duckdb::loki::IsValidLabelName;
 using duckdb::loki::LabelMatcher;
 using duckdb::loki::LineFilter;
 using duckdb::loki::LineOp;
 using duckdb::loki::MatchOp;
 using duckdb::loki::RegexEscapeLiteral;
+using duckdb::loki::SelectorPrefixBeforeBrace;
 using duckdb::loki::TryLikeToSubstring;
 
 TEST_CASE("escape logql string") {
@@ -68,4 +70,24 @@ TEST_CASE("build selector: preserves a trailing pipeline written in the base") {
 	std::vector<LineFilter> filters = {{LineOp::CONTAINS, "x"}};
 	auto q = BuildSelectorQuery("{job=\"api\"} | json", matchers, filters);
 	CHECK_EQ(q, std::string("{job=\"api\", level=\"error\"} | json |= \"x\""));
+}
+
+TEST_CASE("label-name validation follows the Prometheus grammar") {
+	CHECK(IsValidLabelName("job"));
+	CHECK(IsValidLabelName("_private"));
+	CHECK(IsValidLabelName("Level2_x"));
+	CHECK_FALSE(IsValidLabelName(""));
+	CHECK_FALSE(IsValidLabelName("2fast"));
+	CHECK_FALSE(IsValidLabelName("has-dash"));
+	CHECK_FALSE(IsValidLabelName("has space"));
+	// The injection shape: a name that would close the selector and append a line filter.
+	CHECK_FALSE(IsValidLabelName("job\"} |= \"pwned"));
+}
+
+TEST_CASE("selector prefix before the opening brace is reported") {
+	CHECK_EQ(SelectorPrefixBeforeBrace("{job=\"api\"}"), std::string(""));
+	CHECK_EQ(SelectorPrefixBeforeBrace("  {job=\"api\"} | json "), std::string(""));
+	CHECK_EQ(SelectorPrefixBeforeBrace(""), std::string(""));
+	CHECK_EQ(SelectorPrefixBeforeBrace("no braces at all"), std::string(""));
+	CHECK_EQ(SelectorPrefixBeforeBrace("DROPPED {job=\"api\"}"), std::string("DROPPED"));
 }

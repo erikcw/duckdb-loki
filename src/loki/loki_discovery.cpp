@@ -144,8 +144,8 @@ void FetchDiscovery(LokiDiscoveryGlobalState &state, DiscoveryKind kind, const c
 		throw IOException(StringUtil::Format("%s: request to Loki failed: %s", fn, response.error));
 	}
 	if (response.status < 200 || response.status >= 300) {
-		throw IOException(
-		    StringUtil::Format("%s: Loki returned HTTP %d: %s", fn, response.status, response.body.substr(0, 1000)));
+		throw IOException(StringUtil::Format("%s: Loki returned HTTP %d: %s", fn, response.status,
+		                                     loki::ResponseSnippet(response.body, 1000)));
 	}
 	// The parsers throw std::runtime_error on malformed bodies; surface as an IOException.
 	try {

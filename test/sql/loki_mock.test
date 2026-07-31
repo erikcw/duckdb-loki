@@ -262,3 +262,89 @@ ORDER BY labels['level'];
 ----
 api	error
 api	info
+
+# ============================================================================================
+# Security regressions (docs/SECURITY-REVIEW.md). Every case below is a fix asserted through
+# the mock's request-echo mode — i.e. against the bytes the extension actually sent.
+# ============================================================================================
+
+# The unscoped secrets created above would otherwise win the secret-less lookups below at
+# score 0; drop them so each case sees only the secret it creates.
+statement ok
+DROP SECRET mock_auth;
+
+statement ok
+DROP SECRET env_auth;
+
+statement ok
+DROP SECRET env_override;
+
+# A SCOPE'd loki secret is selected for an endpoint its scope covers. The lookup used to pass
+# an empty path, which scores every non-empty scope INT64_MIN — so scoped secrets could never
+# match at all and scoping was silently a no-op.
+statement ok
+CREATE SECRET scoped_ok (TYPE loki, ENDPOINT '${LOKI_MOCK_URL}', TOKEN 'glc_secret',
+                         TENANT 'scoped-tenant', SCOPE '${LOKI_MOCK_URL}');
+
+query II
+SELECT structured_metadata['req_auth'], structured_metadata['req_tenant']
+FROM loki(selector := '{job="__echo__"}', endpoint := '${LOKI_MOCK_URL}');
+----
+bearer	scoped-tenant
+
+statement ok
+DROP SECRET scoped_ok;
+
+# …and a secret scoped to a *different* host is not attached to the endpoint this query names:
+# its credentials never leave the Loki it was created for.
+statement ok
+CREATE SECRET scoped_elsewhere (TYPE loki, ENDPOINT 'https://logs.internal.example',
+                                TOKEN 'glc_internal', TENANT 'leaked-tenant',
+                                SCOPE 'https://logs.internal.example');
+
+query II
+SELECT structured_metadata['req_auth'], structured_metadata['req_tenant']
+FROM loki(selector := '{job="__echo__"}', endpoint := '${LOKI_MOCK_URL}');
+----
+(empty)	(empty)
+
+statement ok
+DROP SECRET scoped_elsewhere;
+
+# Label names go into the LogQL selector unescaped, so a name outside the label grammar could
+# close the selector and append filters of its own. Rejected at bind time.
+statement error
+SELECT line FROM loki(selector := '{job="__echo__"}', endpoint := '${LOKI_MOCK_URL}',
+                      labels := ['job"} |= "pwned']);
+----
+invalid label name
+
+# Text before the selector's `{` used to be dropped silently, quietly changing the query.
+statement error
+SELECT line FROM loki(selector := 'DROPPED_PREFIX {job="__echo__"}', endpoint := '${LOKI_MOCK_URL}');
+----
+before the stream selector
+
+# An INTERVAL bound too large for int64 nanoseconds used to wrap (signed overflow, UB) into a
+# nonsense window; now it is a clear bind error.
+statement error
+SELECT line FROM loki_scan('{job="__echo__"}', endpoint := '${LOKI_MOCK_URL}',
+                           start := INTERVAL 200000000 DAY);
+----
+nanosecond
+
+# `timestamp <= 'infinity'` used to push `INT64_MAX + 1`, wrapping the `end` bound to INT64_MIN
+# and inverting the window. The bound is now simply not pushed, so `end` stays the default.
+query I
+SELECT CAST(structured_metadata['req_end'] AS BIGINT) > 0
+FROM loki(selector := '{job="__echo__"}', endpoint := '${LOKI_MOCK_URL}')
+WHERE timestamp <= 'infinity'::TIMESTAMP_NS;
+----
+true
+
+# A NULL header value would stringify to the literal header value `NULL`; reject it instead.
+statement error
+SELECT line FROM loki(selector := '{job="__echo__"}', endpoint := '${LOKI_MOCK_URL}',
+                      headers := MAP {'X-Foo': NULL});
+----
+NULL value

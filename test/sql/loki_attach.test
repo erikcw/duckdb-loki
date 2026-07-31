@@ -191,3 +191,10 @@ SELECT count(*) FROM (DESCRIBE noauto.public.logs) WHERE column_name NOT IN ('ti
 
 statement ok
 DETACH noauto;
+
+# An invalid label name in the explicit `labels` option is rejected: promoted names are
+# interpolated into the LogQL selector unescaped (docs/SECURITY-REVIEW.md #4).
+statement error
+ATTACH '${LOKI_MOCK_URL}' AS badlabel (TYPE loki, labels ['job"} |= "pwned']);
+----
+invalid label name

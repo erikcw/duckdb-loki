@@ -9,6 +9,13 @@
 namespace duckdb {
 namespace loki {
 
+// Truncated, sanitized view of a response body for embedding in an error message: at most
+// `max_bytes` bytes, with tabs/newlines folded to spaces and every other byte outside printable
+// ASCII replaced by `?`. The body is attacker-controlled and cut at a byte offset, so without
+// this the error string can carry arbitrary control bytes or half a multi-byte codepoint into
+// clients and serializers that require valid UTF-8.
+std::string ResponseSnippet(const std::string &body, size_t max_bytes = 500);
+
 // Parse a Loki query_range response whose `data.resultType` is "streams".
 // Returns one StreamChunk per stream. Throws std::runtime_error if the body is not
 // valid JSON, lacks `data`, or is not a streams result (the message includes a snippet

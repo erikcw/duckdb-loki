@@ -6,6 +6,7 @@
 #include <string>
 
 using duckdb::loki::ParseStreamsResponse;
+using duckdb::loki::ResponseSnippet;
 using duckdb::loki::StreamChunk;
 
 TEST_CASE("parse streams response") {
@@ -98,4 +99,13 @@ TEST_CASE("metric resultType is rejected") {
 		threw = true;
 	}
 	CHECK(threw);
+}
+
+TEST_CASE("response snippet truncates and sanitizes hostile bytes") {
+	CHECK_EQ(ResponseSnippet("plain error", 100), std::string("plain error"));
+	CHECK_EQ(ResponseSnippet("abcdef", 3), std::string("abc..."));
+	// Invalid UTF-8 and control bytes must not reach the error message verbatim.
+	CHECK_EQ(ResponseSnippet(std::string("a\xff\xfe\x80z", 5), 100), std::string("a???z"));
+	CHECK_EQ(ResponseSnippet(std::string("a\0b", 3), 100), std::string("a?b"));
+	CHECK_EQ(ResponseSnippet("line1\nline2\ttab", 100), std::string("line1 line2 tab"));
 }

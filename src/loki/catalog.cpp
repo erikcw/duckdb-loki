@@ -16,6 +16,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/types/vector.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
@@ -73,13 +74,24 @@ vector<string> FetchLokiLabelNames(const std::string &endpoint, const loki::Auth
 	}
 	if (response.status < 200 || response.status >= 300) {
 		throw IOException(StringUtil::Format("ATTACH (TYPE loki): label auto-discovery got HTTP %d: %s",
-		                                     response.status, response.body.substr(0, 1000)));
+		                                     response.status, loki::ResponseSnippet(response.body, 1000)));
 	}
+	vector<string> discovered;
 	try {
-		return loki::ParseStringArrayResponse(response.body);
+		discovered = loki::ParseStringArrayResponse(response.body);
 	} catch (const std::exception &e) {
 		throw IOException(std::string("ATTACH (TYPE loki): label auto-discovery: ") + e.what());
 	}
+	// These names are server-controlled — Loki derives them from ingested data — and they become
+	// both DuckDB column names and (unescaped) LogQL matcher names in every later query. Drop
+	// anything outside the label grammar instead of letting a polluted Loki steer our LogQL.
+	vector<string> valid;
+	for (auto &name : discovered) {
+		if (loki::IsValidLabelName(name)) {
+			valid.push_back(std::move(name));
+		}
+	}
+	return valid;
 }
 
 // Build a MAP(VARCHAR, VARCHAR) Value from a label set (same as the logs/discovery scans).
@@ -146,7 +158,7 @@ void LokiSeriesScanFunction(ClientContext &context, TableFunctionInput &data_p, 
 		}
 		if (response.status < 200 || response.status >= 300) {
 			throw IOException(StringUtil::Format("loki series: Loki returned HTTP %d: %s", response.status,
-			                                     response.body.substr(0, 1000)));
+			                                     loki::ResponseSnippet(response.body, 1000)));
 		}
 		try {
 			state.rows = loki::ParseSeriesResponse(response.body);
@@ -166,6 +178,9 @@ void LokiSeriesScanFunction(ClientContext &context, TableFunctionInput &data_p, 
 		for (idx_t out = 0; out < state.column_ids.size(); out++) {
 			const column_t src = state.column_ids[out];
 			if (src == COLUMN_IDENTIFIER_ROW_ID || IsVirtualColumn(src)) {
+				// NULL, not skip: SetCardinality still counts this row, so an untouched slot would
+				// be an uninitialized flat-vector entry (see the same guard in LokiScanFunction).
+				FlatVector::SetNull(output.data[out], count, true);
 				continue;
 			}
 			auto &vec = output.data[out];
@@ -438,6 +453,15 @@ unique_ptr<Catalog> LokiAttach(optional_ptr<StorageExtensionInfo>, ClientContext
 	// GET /labels — the "both" behavior chosen for ATTACH, where a bare attach is still usable.
 	bool labels_explicit = info.options.find("labels") != info.options.end();
 	auto explicit_labels = ParseStringListOption(info.options, "labels");
+	for (const auto &label : explicit_labels) {
+		// Promoted label names go into the LogQL selector unescaped; reject anything that is not a
+		// label name outright (auto-discovered names are filtered instead, in FetchLokiLabelNames).
+		if (!loki::IsValidLabelName(label)) {
+			throw BinderException("ATTACH (TYPE loki): invalid label name '%s' in the `labels` option; label names "
+			                      "must match [a-zA-Z_][a-zA-Z0-9_]*",
+			                      label);
+		}
+	}
 
 	// Resolve this tenant's promoted columns: the explicit list, or auto-discovered names.
 	auto resolve_labels = [&](const string &tenant_id) -> vector<string> {

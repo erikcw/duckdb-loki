@@ -32,6 +32,17 @@ struct LineFilter {
 // the common control characters. Used for both label-matcher and line-filter values.
 std::string EscapeLogQLString(const std::string &value);
 
+// True when `name` matches the Prometheus/Loki label-name grammar `[a-zA-Z_][a-zA-Z0-9_]*`.
+// Label names have no escaping in LogQL — they are concatenated into the selector verbatim —
+// and under ATTACH they come from the server's own /labels output, so every name that can reach
+// a matcher (an explicit `labels := [...]`, or auto-discovery) is validated with this first.
+bool IsValidLabelName(const std::string &name);
+
+// The non-whitespace text preceding the first `{` of a stream selector, or "" when there is
+// none. BuildSelectorQuery keeps only the brace contents plus the trailing pipeline, so callers
+// check this at bind time and reject a stray prefix rather than silently dropping it.
+std::string SelectorPrefixBeforeBrace(const std::string &selector);
+
 // Escape RE2 regex metacharacters so a literal string matches itself inside a `=~`/`|~` regex.
 std::string RegexEscapeLiteral(const std::string &literal);
 
