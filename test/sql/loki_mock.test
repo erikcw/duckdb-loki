@@ -264,8 +264,8 @@ api	error
 api	info
 
 # ============================================================================================
-# Security regressions (docs/SECURITY-REVIEW.md). Every case below is a fix asserted through
-# the mock's request-echo mode — i.e. against the bytes the extension actually sent.
+# Security regressions. Every case below pins a fix through the mock's request-echo mode — i.e.
+# against the bytes the extension actually sent — and says in place what the bug was.
 # ============================================================================================
 
 # The unscoped secrets created above would otherwise win the secret-less lookups below at
