@@ -72,6 +72,22 @@ STREAM_FIXTURE = streams_body(
 # Discovery fixtures.
 LABELS_FIXTURE = {"status": "success", "data": ["job", "level", "pod"]}
 LABEL_VALUES_FIXTURE = {"status": "success", "data": ["api", "web"]}
+
+# Label-set rotation, so a test can prove that a label REFRESH picks up a label that did not exist
+# at ATTACH time (DESIGN.md §11.8). Requesting the values of the magic label `__rotate__` bumps the
+# generation; from then on /labels also reports `rotated`. Driving it through the ordinary
+# /label/{name}/values endpoint keeps the mock's protocol unchanged — the test just calls
+# loki_label_values('__rotate__') — and leaves /query_range untouched.
+ROTATE_LABEL = "__rotate__"
+LABEL_GENERATION = 0
+
+# Same trick for the failure direction: after asking for the values of `__break_labels__`, /labels
+# starts returning 500. That lets a test prove a TTL refresh failure is swallowed and the previous
+# label snapshot keeps serving queries (DESIGN.md §11.8).
+BREAK_LABELS_LABEL = "__break_labels__"
+LABELS_BROKEN = False
+
+
 SERIES_FIXTURE = {
     "status": "success",
     "data": [
@@ -79,6 +95,13 @@ SERIES_FIXTURE = {
         {"job": "api", "level": "info"},
     ],
 }
+
+
+def labels_body():
+    names = list(LABELS_FIXTURE["data"])
+    if LABEL_GENERATION > 0:
+        names.append("rotated")
+    return {"status": "success", "data": names}
 
 
 def echo_body(params, auth, tenant):
@@ -129,6 +152,11 @@ class Handler(BaseHTTPRequestHandler):
         return ""
 
     def do_GET(self):
+        # Declared up front: both are assigned further down, and Python rejects a `global` that
+        # follows the name's first use in the same function.
+        global LABEL_GENERATION
+        global LABELS_BROKEN
+
         parsed = urlparse(self.path)
         path = parsed.path
         params = parse_qs(parsed.query)
@@ -152,11 +180,23 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == API + "/labels":
-            self._send_json(200, LABELS_FIXTURE)
+            if LABELS_BROKEN:
+                self._send_json(500, {"status": "error", "error": "mock: /labels is broken on purpose"})
+                return
+            self._send_json(200, labels_body())
             return
 
         # /label/{name}/values
         if path.startswith(API + "/label/") and path.endswith("/values"):
+            name = path[len(API + "/label/") : -len("/values")]
+            if name == ROTATE_LABEL:
+                LABEL_GENERATION += 1
+                self._send_json(200, {"status": "success", "data": [str(LABEL_GENERATION)]})
+                return
+            if name == BREAK_LABELS_LABEL:
+                LABELS_BROKEN = True
+                self._send_json(200, {"status": "success", "data": ["broken"]})
+                return
             self._send_json(200, LABEL_VALUES_FIXTURE)
             return
 

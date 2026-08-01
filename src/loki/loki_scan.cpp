@@ -8,6 +8,7 @@
 #include "loki/pager.hpp"
 #include "loki/parse.hpp"
 
+#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/parser/column_definition.hpp"
@@ -34,8 +35,6 @@
 namespace duckdb {
 
 namespace {
-
-constexpr int64_t NANOS_PER_HOUR = 3600LL * 1000LL * 1000LL * 1000LL;
 
 struct LokiScanGlobalState : public GlobalTableFunctionState {
 	LokiScanGlobalState(std::string endpoint_p, std::vector<std::pair<std::string, std::string>> headers_p,
@@ -78,6 +77,7 @@ bool TryValueToEpochNsExact(const Value &value, int64_t &out) {
 // or `base_selector`) before calling this. The function name for error messages is `fn`.
 void LokiResolveCommon(ClientContext &context, TableFunctionBindInput &input, LokiScanBindData &result,
                        vector<LogicalType> &return_types, vector<string> &names, const char *fn) {
+	result.fn_name = fn;
 	ResolveLokiConnection(context, input, result.endpoint, result.auth, fn);
 
 	if (auto *p = FindNamedParam(input, "limit")) {
@@ -97,7 +97,7 @@ void LokiResolveCommon(ClientContext &context, TableFunctionBindInput &input, Lo
 	// Default to the last hour, ending now (DESIGN.md §6.6) — never issue an unbounded query.
 	int64_t now_ns = Timestamp::GetEpochNanoSeconds(Timestamp::GetCurrentTimestamp());
 	result.end_ns = now_ns;
-	result.start_ns = now_ns - NANOS_PER_HOUR;
+	result.start_ns = now_ns - LOKI_NANOS_PER_HOUR;
 	if (auto *p = FindNamedParam(input, "start")) {
 		result.start_ns = ResolveTimeBound(*p, now_ns);
 		result.has_param_start = true;
@@ -111,6 +111,7 @@ void LokiResolveCommon(ClientContext &context, TableFunctionBindInput &input, Lo
 	// values are directly selectable and (for loki()) its predicates are pushable. Unlisted labels
 	// still appear inside the `labels` MAP. See DESIGN.md §3.2 / §4.2.
 	if (auto *p = FindNamedParam(input, "labels")) {
+		case_insensitive_set_t seen;
 		for (const auto &child : ListValue::GetChildren(*p)) {
 			if (child.IsNull()) {
 				throw BinderException("%s 'labels' must not contain NULL entries", fn);
@@ -122,6 +123,17 @@ void LokiResolveCommon(ClientContext &context, TableFunctionBindInput &input, Lo
 				throw BinderException("%s: invalid label name '%s' in 'labels'; label names must match "
 				                      "[a-zA-Z_][a-zA-Z0-9_]*",
 				                      fn, label);
+			}
+			// Catch the two ways a promoted label collides with the fixed schema before DuckDB's
+			// ColumnList does, which would otherwise report an opaque "Column ... already exists!".
+			if (LokiIsReservedColumnName(label)) {
+				throw BinderException("%s: label '%s' cannot be promoted — that name is already one of the fixed "
+				                      "output columns (timestamp, line, labels, structured_metadata); read it from "
+				                      "the labels MAP instead, e.g. labels['%s']",
+				                      fn, label, label);
+			}
+			if (!seen.insert(label).second) {
+				throw BinderException("%s: duplicate label '%s' in 'labels'", fn, label);
 			}
 			result.label_columns.push_back(std::move(label));
 		}
@@ -251,6 +263,10 @@ bool TryComparison(ClientContext &context, const LogicalGet &get, LokiScanBindDa
 		return false;
 	}
 
+	// The "timestamp"/"line" cases below are keyed on the fixed logs-schema column names. The
+	// catalog's `series` table reuses this translator but has neither column, and a promoted label
+	// can never be named either (LokiIsReservedColumnName rejects/filters those), so on the series
+	// path control always falls through to the label-matcher handling — which is what it wants.
 	if (col_name == "timestamp") {
 		// Coarse time-window bound: push it to Loki, but keep the predicate residual so DuckDB
 		// applies it exactly (guards against any boundary/inclusivity mismatch). Loki's `end` is
@@ -471,8 +487,7 @@ unique_ptr<GlobalTableFunctionState> LokiScanInitGlobal(ClientContext &context, 
 		// Mandatory-selector rule (DESIGN.md §4.3): Loki refuses a query with no matcher. An empty
 		// selector renders as `{}`; require a base selector or at least one pushed label matcher.
 		if (query.size() >= 2 && query[0] == '{' && query[1] == '}') {
-			throw BinderException("loki: a stream selector is required — pass selector := '{job=\"api\"}' or add a "
-			                      "WHERE equality/IN on a promoted label column (labels := [...])");
+			throw BinderException("%s: a stream selector is required — %s", bind_data.fn_name, bind_data.selector_hint);
 		}
 		// Pushed WHERE bounds refine the window: they override the default when no explicit
 		// start:=/end:= was given, and intersect with it when one was.
@@ -501,15 +516,6 @@ unique_ptr<GlobalTableFunctionState> LokiScanInitGlobal(ClientContext &context, 
 	return std::move(state);
 }
 
-// Build a MAP(VARCHAR, VARCHAR) Value from a string map (labels or structured metadata).
-Value MapFromStrings(const std::map<std::string, std::string> &m) {
-	InsertionOrderPreservingMap<string> ordered;
-	for (const auto &kv : m) {
-		ordered.insert(kv.first, kv.second);
-	}
-	return Value::MAP(ordered);
-}
-
 void LokiScanFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<LokiScanGlobalState>();
 	auto &bind_data = data_p.bind_data->Cast<LokiScanBindData>();
@@ -530,11 +536,11 @@ void LokiScanFunction(ClientContext &context, TableFunctionInput &data_p, DataCh
 			std::string query_string = loki::BuildQueryString(request);
 			auto response = loki::HttpGet(state.endpoint, request.path, query_string, state.headers);
 			if (!response.error.empty()) {
-				throw IOException("loki_scan: request to Loki failed: " + response.error);
+				throw IOException(bind_data.fn_name + ": request to Loki failed: " + response.error);
 			}
 			if (response.status < 200 || response.status >= 300) {
-				throw IOException(StringUtil::Format("loki_scan: Loki returned HTTP %d: %s", response.status,
-				                                     loki::ResponseSnippet(response.body, 1000)));
+				throw IOException(StringUtil::Format("%s: Loki returned HTTP %d: %s", bind_data.fn_name,
+				                                     response.status, loki::ResponseSnippet(response.body, 1000)));
 			}
 			// ParseStreamsResponse throws std::runtime_error on malformed/non-streams bodies.
 			auto chunks = loki::ParseStreamsResponse(response.body);
@@ -570,9 +576,9 @@ void LokiScanFunction(ClientContext &context, TableFunctionInput &data_p, DataCh
 				auto it = row.labels.find(name);
 				vec.SetValue(count, it != row.labels.end() ? Value(it->second) : Value(LogicalType::VARCHAR));
 			} else if (src == labels_map_col) {
-				vec.SetValue(count, MapFromStrings(row.labels));
+				vec.SetValue(count, LokiMapFromStrings(row.labels));
 			} else { // smeta_map_col
-				vec.SetValue(count, MapFromStrings(row.structured_metadata));
+				vec.SetValue(count, LokiMapFromStrings(row.structured_metadata));
 			}
 		}
 
@@ -605,6 +611,19 @@ void AddCommonNamedParameters(TableFunction &fn) {
 }
 
 } // namespace
+
+bool LokiIsReservedColumnName(const std::string &name) {
+	return StringUtil::CIEquals(name, "timestamp") || StringUtil::CIEquals(name, "line") ||
+	       StringUtil::CIEquals(name, "labels") || StringUtil::CIEquals(name, "structured_metadata");
+}
+
+Value LokiMapFromStrings(const std::map<std::string, std::string> &m) {
+	InsertionOrderPreservingMap<string> ordered;
+	for (const auto &kv : m) {
+		ordered.insert(kv.first, kv.second);
+	}
+	return Value::MAP(ordered);
+}
 
 // Wire a TableFunction to the pushdown scan core (execute + pushdown_complex_filter + projection
 // pushdown) with NO bind — the ATTACH catalog's `logs` table supplies its own pre-built

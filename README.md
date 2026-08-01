@@ -9,9 +9,10 @@ This repository is based on https://github.com/duckdb/extension-template.
 > `loki_scan()` function, the pushdown-driven `loki()` function (label/time/line-filter
 > pushdown into LogQL), promoted **label columns**, **projection pushdown**,
 > **structured metadata**, the `loki_labels` / `loki_label_values` / `loki_series` discovery
-> helpers, **secrets-based auth**, and **automatic paging** over Loki's per-request cap.
-> Targets DuckDB **v1.5.4**. Still to come: the community-extensions submission (v1.0) and
-> `ATTACH` (v1.1). See [`DESIGN.md`](./DESIGN.md) for the full specification and roadmap.
+> helpers, **secrets-based auth**, **automatic paging** over Loki's per-request cap, and
+> **`ATTACH`** — Loki as a read-only attached database. Targets DuckDB **v1.5.5**. Still to
+> come: the community-extensions submission (v1.0). See [`DESIGN.md`](./DESIGN.md) for the full
+> specification and roadmap.
 
 ## Usage
 
@@ -162,7 +163,9 @@ a `WHERE` equality/IN on a promoted label to synthesize one — otherwise it rai
 ### Loki as a table — a view over `loki()`
 
 Because DuckDB pushes a view's predicates down into the underlying table function, a plain view
-over `loki()` gives the `FROM logs WHERE ...` experience with full pushdown and no extra setup:
+over `loki()` gives the `FROM logs WHERE ...` experience with full pushdown and no extra setup.
+(For catalog semantics — schemas, discovery, multi-tenancy — see [`ATTACH`](#attach--loki-as-a-database)
+instead.)
 
 ```sql
 CREATE VIEW logs AS
@@ -173,6 +176,88 @@ FROM logs
 WHERE job = 'api' AND level = 'error'          -- pushed through the view into loki()'s pushdown
   AND timestamp >= TIMESTAMP '2026-07-04 00:00:00';
 ```
+
+## `ATTACH` — Loki as a database
+
+`ATTACH` exposes a whole Loki instance as a read-only database, so logs are reachable by name
+instead of by table function:
+
+```sql
+ATTACH 'my_loki' AS lk (TYPE loki);          -- 'my_loki' names a loki secret
+-- or inline:
+ATTACH 'https://logs.example.net' AS lk (TYPE loki, TOKEN 'glc_...', TENANT '1234');
+
+SELECT timestamp, line
+FROM lk.public.logs
+WHERE job = 'api' AND level = 'error'
+  AND timestamp >= TIMESTAMP '2026-07-04 00:00:00'
+  AND line LIKE '%timeout%';
+```
+
+The catalog is `database` → `schema` (one per tenant) → a small **fixed** set of tables:
+
+| table    | contents                                                                          |
+|----------|-----------------------------------------------------------------------------------|
+| `logs`   | the log entries — same columns as `loki()`, same pushdown, same paging             |
+| `labels` | one row per label name (`GET /labels`), for exploration and autocomplete           |
+| `series` | one row per matching series (`GET /series`); requires a selector from `WHERE`      |
+
+> ### ⚠️ A bare `SELECT * FROM lk.public.logs` cannot run
+>
+> Loki refuses any query without a stream selector, so a scan with no `WHERE` on a label column
+> raises an error naming the fix. This is Loki's data model, not a limitation we can engineer
+> away — **BI tools and preview queries that assume a plain table scan will hit it.** Always
+> filter on at least one label:
+>
+> ```sql
+> SELECT * FROM lk.public.logs;                    -- error: a stream selector is required
+> SELECT * FROM lk.public.logs WHERE job = 'api';  -- fine
+> ```
+
+**Label columns.** Only *promoted* label columns are pushable (same rule as `loki()` — see
+[Pushdown](#pushdown--loki)). Unlike `loki()`, which promotes nothing unless you pass
+`labels := [...]`, **`ATTACH` auto-discovers** them via `GET /labels` at attach time, because
+there is no per-query argument list and a bare `ATTACH` still has to be useful. Pin them
+explicitly — or opt out entirely — with the `labels` option:
+
+```sql
+ATTACH 'my_loki' AS lk (TYPE loki, labels ['job', 'level']);  -- pin these two
+ATTACH 'my_loki' AS lk (TYPE loki, labels []);                -- promote nothing
+```
+
+A label whose name collides with a fixed column (`timestamp`, `line`, `labels`,
+`structured_metadata`) is skipped when discovered, and rejected when named explicitly; read it
+from the `labels` MAP instead.
+
+**Multi-tenant.** Loki has no API to enumerate tenants, so list them yourself; each becomes a
+schema whose queries carry its `X-Scope-OrgID`:
+
+```sql
+ATTACH 'my_loki' AS lk (TYPE loki, tenants ['team-a', 'team-b']);
+SELECT * FROM lk."team-a".logs WHERE job = 'api';
+```
+
+**Keeping labels fresh.** The discovered label set is a snapshot taken at attach time, so new
+labels do not appear on their own. Two ways to pick them up:
+
+```sql
+PRAGMA loki_refresh_labels('lk');   -- re-discover now (omit the argument for every loki db)
+ATTACH 'my_loki' AS lk (TYPE loki, label_cache_ttl '5m');   -- or re-discover on demand
+```
+
+`label_cache_ttl` defaults to `0` (never). With a TTL set, the first statement after it expires
+re-fetches; if Loki is unreachable the previous snapshot keeps serving and the refresh is retried
+later, so an outage never makes an attached database unqueryable. Note that a refresh which
+*adds* a column changes the table's schema, which invalidates views defined as
+`SELECT *` over it — list columns explicitly in views over `logs`.
+
+**Other options and limits.**
+
+- Read-only: no `INSERT`/`CREATE`/`DROP`/`UPDATE` against Loki.
+- `series_max_rows N` (default 100000) caps the `series` table. Loki's `/series` endpoint takes
+  no limit and no cursor, so a broad selector can only be answered by materializing everything;
+  past the cap the scan errors instead of ballooning. Narrow the selector or the time window.
+- Without a `WHERE` on `timestamp`, scans use the same default window as `loki()`: the last hour.
 
 ## Discovery helpers
 
@@ -231,13 +316,20 @@ cmake -B build/unit -S test/cpp && cmake --build build/unit
 ctest --test-dir build/unit --output-on-failure
 ```
 
-For end-to-end SQL without a live Loki, `./test/mock` runs the SQL tests against a tiny
-in-process Python mock of the Loki API. It's deterministic (no network) and, via a
-request-echo mode, asserts exactly which `WHERE` predicates get translated into the LogQL
-query — the guard for filter-pushdown *translation*. Needs only `python3`:
+For end-to-end SQL without a live Loki, `./test/mock` runs the server-dependent SQL tests
+(`loki_mock.test`, `loki_attach.test`) against a tiny in-process Python mock of the Loki API.
+It's deterministic (no network) and, via a request-echo mode, asserts exactly which `WHERE`
+predicates get translated into the LogQL query — the guard for filter-pushdown *translation*.
+Those files are `require-env LOKI_MOCK_URL`-gated, so `make test` skips them and only this
+script runs them. Needs only `python3`:
 ```sh
-./test/mock/run.sh
+./test/mock/run.sh                          # every mock-gated suite
+./test/mock/run.sh test/sql/loki_attach.test # or just one
 ```
+
+The `ATTACH` surfaces that need no server — read-only enforcement, catalog enumeration,
+default-schema resolution, and the option surface — live in `test/sql/loki_attach_offline.test`
+and run under a plain `make test`.
 
 All of the above drive a build with the extension **statically linked in**. To smoke-test the
 actual shipped **loadable binary**, `./test/loadable` `LOAD`s it into a *stock* DuckDB CLI (one

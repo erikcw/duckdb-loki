@@ -1,0 +1,424 @@
+# name: test/sql/loki_attach_offline.test
+# description: ATTACH ... (TYPE loki) surfaces that need no server — read-only enforcement, catalog
+# group: [sql]
+
+#
+#              enumeration, default-schema resolution, and the ATTACH option surface (DESIGN.md §3.6).
+#
+# Everything here attaches with an explicit `labels` list, which suppresses the attach-time
+# GET /labels auto-discovery — so no HTTP happens and the endpoint never has to exist. That is why
+# this file runs under a plain `make test`, unlike test/sql/loki_attach.test which needs the mock.
+#
+# Nothing here may depend on the ABSENCE of a default `loki` secret: a developer's machine may have
+# one, and the endpoint fallback (§3.1) would then silently succeed where we expected an error.
+
+require loki
+
+# A dead endpoint: bind/DESCRIBE/catalog work never touches the network, so this is enough for
+# everything below. Any statement that actually scans would fail with a connection error.
+statement ok
+ATTACH 'http://127.0.0.1:1' AS lk (TYPE loki, labels ['job', 'level']);
+
+# ============================================================================================
+# Catalog enumeration — served entirely from attach-time state, never a live Loki call.
+# ============================================================================================
+
+# The fixed table set (DESIGN.md §3.6): `logs` plus the `labels`/`series` exploration tables.
+query I
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'lk' ORDER BY table_name;
+----
+labels
+logs
+series
+
+# The `logs` schema and its column ORDER are load-bearing: LokiScanFunction's source-index math
+# (0=timestamp, 1=line, [2..2+N)=promoted labels, then the two MAPs) assumes exactly this layout.
+query II
+SELECT column_name, data_type FROM information_schema.columns
+WHERE table_catalog = 'lk' AND table_name = 'logs' ORDER BY ordinal_position;
+----
+timestamp	TIMESTAMP_NS
+line	VARCHAR
+job	VARCHAR
+level	VARCHAR
+labels	MAP(VARCHAR, VARCHAR)
+structured_metadata	MAP(VARCHAR, VARCHAR)
+
+# `series` promotes the same label columns but carries no timestamp/line.
+query I
+SELECT column_name FROM information_schema.columns
+WHERE table_catalog = 'lk' AND table_name = 'series' ORDER BY ordinal_position;
+----
+job
+level
+labels
+
+query I
+SELECT column_name FROM information_schema.columns
+WHERE table_catalog = 'lk' AND table_name = 'labels' ORDER BY ordinal_position;
+----
+label
+
+# ============================================================================================
+# Default schema resolution.
+# ============================================================================================
+
+statement ok
+USE lk;
+
+query I
+SELECT current_schema();
+----
+public
+
+statement ok
+USE memory;
+
+# Multi-tenant: one schema per `tenants` entry, and GetDefaultSchema returns the FIRST one as
+# listed (not sorted) — pinning this because it is order-dependent and easy to break.
+statement ok
+ATTACH 'http://127.0.0.1:1' AS mt (TYPE loki, labels ['job'], tenants ['beta', 'alpha']);
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'mt' ORDER BY schema_name;
+----
+alpha
+beta
+
+statement ok
+USE mt;
+
+query I
+SELECT current_schema();
+----
+beta
+
+statement ok
+USE memory;
+
+statement ok
+DETACH mt;
+
+# ============================================================================================
+# Read-only enforcement (DESIGN.md §3.6) — two different guards, depending on the ATTACH form.
+#
+# An http(s):// path is a "remote file", which DuckDB itself bumps to READ_ONLY access mode
+# (DatabaseManager::AttachDatabase), so mutations are refused before reaching the catalog.
+# ============================================================================================
+
+statement error
+CREATE TABLE lk.public.t (i INTEGER);
+----
+read-only mode
+
+statement error
+DROP TABLE lk.public.logs;
+----
+read-only mode
+
+statement error
+ALTER TABLE lk.public.logs RENAME TO other;
+----
+read-only mode
+
+statement error
+CREATE SCHEMA lk.extra;
+----
+read-only mode
+
+statement error
+DROP SCHEMA lk.public;
+----
+read-only mode
+
+statement error
+CREATE VIEW lk.public.v AS SELECT 1;
+----
+read-only mode
+
+statement error
+CREATE SEQUENCE lk.public.sq;
+----
+read-only mode
+
+statement error
+CREATE TYPE lk.public.ty AS ENUM ('a');
+----
+read-only mode
+
+# UPDATE/DELETE/CREATE INDEX never reach either guard: the binder rejects them first because
+# `logs` is not a base table (it has no row ids — GetRowIdColumns is empty).
+statement error
+UPDATE lk.public.logs SET line = 'x';
+----
+Can only update base table
+
+statement error
+DELETE FROM lk.public.logs;
+----
+Can only delete from base table
+
+statement error
+CREATE INDEX idx ON lk.public.logs (line);
+----
+can only create an index on a base table
+
+statement ok
+DETACH lk;
+
+# ============================================================================================
+# The same mutations against a secret-name ATTACH, which is NOT a remote path and therefore
+# keeps READ_WRITE access mode — here the catalog's own read-only stubs are what refuse them.
+# ============================================================================================
+
+statement ok
+CREATE SECRET offline_loki (TYPE loki, ENDPOINT 'http://127.0.0.1:1');
+
+statement ok
+ATTACH 'offline_loki' AS sk (TYPE loki, labels ['job']);
+
+query I
+SELECT readonly FROM duckdb_databases() WHERE database_name = 'sk';
+----
+false
+
+statement error
+CREATE TABLE sk.public.t (i INTEGER);
+----
+loki catalog is read-only
+
+statement error
+CREATE TABLE sk.public.t AS SELECT 1 AS i;
+----
+loki catalog is read-only
+
+statement error
+INSERT INTO sk.public.logs VALUES (now(), 'x', 'a', MAP {}, MAP {});
+----
+loki catalog is read-only
+
+statement error
+DROP TABLE sk.public.logs;
+----
+loki catalog is read-only
+
+statement error
+ALTER TABLE sk.public.logs RENAME TO other;
+----
+loki catalog is read-only
+
+statement error
+CREATE SCHEMA sk.extra;
+----
+loki catalog is read-only
+
+statement error
+DROP SCHEMA sk.public;
+----
+loki catalog is read-only
+
+statement error
+CREATE VIEW sk.public.v AS SELECT 1;
+----
+loki catalog is read-only
+
+statement error
+CREATE SEQUENCE sk.public.sq;
+----
+loki catalog is read-only
+
+statement error
+CREATE TYPE sk.public.ty AS ENUM ('a');
+----
+loki catalog is read-only
+
+statement ok
+DETACH sk;
+
+# ============================================================================================
+# Unknown catalog lookups.
+# ============================================================================================
+
+statement ok
+ATTACH 'http://127.0.0.1:1' AS lk (TYPE loki, labels ['job']);
+
+statement error
+SELECT * FROM lk.public.nosuch;
+----
+nosuch does not exist
+
+statement error
+SELECT * FROM lk.nosuch.logs;
+----
+schema "nosuch" does not exist
+
+statement ok
+DETACH lk;
+
+# ============================================================================================
+# ATTACH option surface.
+# ============================================================================================
+
+# A non-URL path is a secret name; naming one that does not exist is an error regardless of
+# whether a default `loki` secret happens to exist.
+statement error
+ATTACH 'no_such_loki_secret_here' AS x (TYPE loki, labels ['job']);
+----
+no secret named 'no_such_loki_secret_here' found
+
+# `labels` and `tenants` accept a comma-separated string as well as a LIST.
+statement ok
+ATTACH 'http://127.0.0.1:1' AS csv1 (TYPE loki, labels 'job,level');
+
+query I
+SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'csv1' AND table_name = 'logs';
+----
+6
+
+statement ok
+DETACH csv1;
+
+statement ok
+ATTACH 'http://127.0.0.1:1' AS csv2 (TYPE loki, labels ['job'], tenants 'a,b');
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'csv2';
+----
+2
+
+statement ok
+DETACH csv2;
+
+# An explicit EMPTY `labels` opts out of auto-discovery entirely: the schema is the frozen
+# four-column contract (DESIGN.md §4.2), and nothing is promoted.
+statement ok
+ATTACH 'http://127.0.0.1:1' AS bare (TYPE loki, labels []);
+
+query I
+SELECT column_name FROM information_schema.columns
+WHERE table_catalog = 'bare' AND table_name = 'logs' ORDER BY ordinal_position;
+----
+timestamp
+line
+labels
+structured_metadata
+
+statement ok
+DETACH bare;
+
+# Invalid label names are rejected outright — they would land in the LogQL selector unescaped.
+statement error
+ATTACH 'http://127.0.0.1:1' AS x (TYPE loki, labels ['bad-name']);
+----
+invalid label name 'bad-name'
+
+# A label that collides with one of the fixed `logs` columns is refused with an explanation, not
+# with DuckDB's opaque "Column with name line already exists!" from ColumnList::AddColumn.
+statement error
+ATTACH 'http://127.0.0.1:1' AS x (TYPE loki, labels ['line']);
+----
+cannot be promoted
+
+statement error
+ATTACH 'http://127.0.0.1:1' AS x (TYPE loki, labels ['job', 'Structured_Metadata']);
+----
+cannot be promoted
+
+# Duplicates collide the same way; the check is case-insensitive because DuckDB's column name map is.
+statement error
+ATTACH 'http://127.0.0.1:1' AS x (TYPE loki, labels ['job', 'JOB']);
+----
+duplicate label 'JOB'
+
+# The inline auth options are accepted alongside the endpoint (their effect on the wire is
+# asserted in test/sql/loki_attach.test, which has a server to echo them back).
+statement ok
+ATTACH 'http://127.0.0.1:1' AS inline1 (TYPE loki, labels ['job'], TOKEN 'glc_x', TENANT '42');
+
+statement ok
+DETACH inline1;
+
+statement ok
+ATTACH 'http://127.0.0.1:1' AS inline2 (TYPE loki, labels ['job'], USERNAME 'u', PASSWORD 'p');
+
+statement ok
+DETACH inline2;
+
+statement ok
+ATTACH 'http://127.0.0.1:1' AS inline3 (TYPE loki, labels ['job'], HEADERS MAP {'X-Api-Key': 'k'});
+
+statement ok
+DETACH inline3;
+
+# ============================================================================================
+# Label cache: the `label_cache_ttl` option and PRAGMA loki_refresh_labels (DESIGN.md §11.8).
+# The refresh round-trip itself is asserted in test/sql/loki_attach.test, which has a server.
+# ============================================================================================
+
+# A TTL governs re-DISCOVERY, so it contradicts an explicit `labels` list, which pins the columns.
+statement error
+ATTACH 'http://127.0.0.1:1' AS x (TYPE loki, labels ['job'], label_cache_ttl '5m');
+----
+drop one of the two options
+
+statement error
+ATTACH 'http://127.0.0.1:1' AS x (TYPE loki, label_cache_ttl 'banana');
+----
+invalid `label_cache_ttl` value
+
+statement error
+ATTACH 'http://127.0.0.1:1' AS x (TYPE loki, label_cache_ttl '-5m');
+----
+invalid `label_cache_ttl` value
+
+statement error
+ATTACH 'http://127.0.0.1:1' AS x (TYPE loki, label_cache_ttl INTERVAL 1 MONTH);
+----
+invalid `label_cache_ttl` value
+
+statement ok
+ATTACH 'http://127.0.0.1:1' AS pinned (TYPE loki, labels ['job']);
+
+# Naming a pinned database explicitly says why it cannot refresh...
+statement error
+PRAGMA loki_refresh_labels('pinned');
+----
+its promoted columns are pinned
+
+# ...but the bare form skips such databases rather than failing over them.
+statement ok
+PRAGMA loki_refresh_labels;
+
+statement ok
+DETACH pinned;
+
+statement error
+PRAGMA loki_refresh_labels('no_such_database');
+----
+no attached database named 'no_such_database'
+
+statement error
+PRAGMA loki_refresh_labels('memory');
+----
+is not an ATTACHed Loki database
+
+# ============================================================================================
+# The `series` enumeration cap (DESIGN.md §3.6). Loki's /series takes no limit and no cursor,
+# so the only defence against an over-broad selector is refusing to materialize the result.
+# ============================================================================================
+
+statement error
+ATTACH 'http://127.0.0.1:1' AS x (TYPE loki, labels ['job'], series_max_rows 0);
+----
+`series_max_rows` must be a positive integer
+
+statement error
+ATTACH 'http://127.0.0.1:1' AS x (TYPE loki, labels ['job'], series_max_rows 'lots');
+----
+`series_max_rows` must be a positive integer
+
+statement ok
+ATTACH 'http://127.0.0.1:1' AS capped (TYPE loki, labels ['job'], series_max_rows 5);
+
+statement ok
+DETACH capped;

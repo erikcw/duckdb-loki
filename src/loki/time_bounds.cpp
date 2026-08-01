@@ -72,5 +72,64 @@ int64_t IntervalToNanos(int32_t months, int32_t days, int64_t micros) {
 	return total;
 }
 
+int64_t ParseDurationToNanos(const std::string &text) {
+	const std::string invalid = "loki: invalid duration '" + text +
+	                            "'; expected a non-negative number with an optional unit suffix "
+	                            "(ms, s, m, h, d) — e.g. '0', '30s', '5m', '1h'";
+
+	size_t begin = text.find_first_not_of(" \t");
+	size_t end = text.find_last_not_of(" \t");
+	if (begin == std::string::npos) {
+		throw std::invalid_argument(invalid);
+	}
+	const std::string trimmed = text.substr(begin, end - begin + 1);
+
+	size_t digits = 0;
+	while (digits < trimmed.size() && trimmed[digits] >= '0' && trimmed[digits] <= '9') {
+		digits++;
+	}
+	if (digits == 0) {
+		throw std::invalid_argument(invalid);
+	}
+
+	std::string suffix = trimmed.substr(digits);
+	for (auto &c : suffix) {
+		if (c >= 'A' && c <= 'Z') {
+			c = static_cast<char>(c - 'A' + 'a');
+		}
+	}
+
+	constexpr int64_t NANOS_PER_MILLI = 1000LL * 1000LL;
+	int64_t unit_nanos = 0;
+	if (suffix.empty() || suffix == "s") {
+		unit_nanos = 1000LL * NANOS_PER_MILLI;
+	} else if (suffix == "ms") {
+		unit_nanos = NANOS_PER_MILLI;
+	} else if (suffix == "m") {
+		unit_nanos = 60LL * 1000LL * NANOS_PER_MILLI;
+	} else if (suffix == "h") {
+		unit_nanos = 3600LL * 1000LL * NANOS_PER_MILLI;
+	} else if (suffix == "d") {
+		unit_nanos = 86400LL * 1000LL * NANOS_PER_MILLI;
+	} else {
+		throw std::invalid_argument(invalid);
+	}
+
+	// Parse the digits by hand rather than via stoll: a value far past int64 must be an
+	// out_of_range for the caller to report, not an unspecified wrap.
+	int64_t value = 0;
+	for (size_t i = 0; i < digits; i++) {
+		int64_t digit = trimmed[i] - '0';
+		if (!TryMultiplyNanos(value, 10, value) || !TryAddNanos(value, digit, value)) {
+			throw std::out_of_range("loki: duration '" + text + "' is too large");
+		}
+	}
+	int64_t total = 0;
+	if (!TryMultiplyNanos(value, unit_nanos, total)) {
+		throw std::out_of_range("loki: duration '" + text + "' is too large to express in nanoseconds");
+	}
+	return total;
+}
+
 } // namespace loki
 } // namespace duckdb

@@ -46,9 +46,10 @@ and cross-platform CI.
   Different result shape; deferred to a stretch function.
 - **Full LogQL parsing/validation.** We build selectors and pipeline stages; we do not
   re-implement Loki's parser. Passthrough LogQL is sent as-is.
-- **`ATTACH` in v1.0.** The catalog integration is a deliberate **fast-follow (§3.6)**,
+- **`ATTACH` in v1.0.** The catalog integration was a deliberate **fast-follow (§3.6)**,
   not part of the first release — it's the largest, most version-coupled chunk of C++ and
-  only pays off once the pushdown core is proven. What we *do* permanently reject is the
+  only pays off once the pushdown core is proven. (Now delivered; see §10 v1.1.) What we *do*
+  permanently reject is the
   **streams-or-label-values-as-tables** mapping (one table per `job`/label value): it
   explodes the catalog and hammers `/series` on every enumeration. The supported mapping is
   a single `logs` virtual table driven by `WHERE` pushdown (§3.6).
@@ -215,13 +216,30 @@ run** — it must raise a clear error asking for at least one label filter. This
 model, not a limitation we can engineer away, and it means BI tools or preview queries that
 assume a plain table scan will hit it. Document it prominently.
 
-**Softer caveats:** discovered label columns are sparse (NULL where a stream lacks the
-label) and can go stale as new labels appear — cache `/labels` with a TTL and a refresh
-path (re-`ATTACH` or a `PRAGMA`). Catalog enumeration (autocomplete, `information_schema`)
-must be served from that cache, never a live Loki call per lookup.
+**Label promotion on the ATTACH path.** Discovered label columns are sparse (NULL where a stream
+lacks the label). Unlike `loki()`, an absent `labels` option here **does** auto-discover via
+`/labels` — ATTACH has no per-query argument list, so a bare `ATTACH` would otherwise expose
+nothing pushable. `labels [...]` pins the columns and `labels []` opts out entirely. See §11.9
+for why the two entry points deliberately differ. A discovered name that is not a valid label
+name, that collides with a fixed column (`timestamp`, `line`, `labels`, `structured_metadata`),
+or that repeats is dropped from promotion — Loki controls those strings, and a collision would
+otherwise fail the whole `ATTACH` with DuckDB's opaque duplicate-column error. Explicitly named
+labels are rejected instead of dropped.
 
-**Scope:** read-only. No `INSERT`/`CREATE`/`DROP` against Loki; the transaction manager is
-a trivial read-only stub.
+**Staleness — resolved in §11.8.** The label set is a snapshot taken at attach time, refreshed
+by `PRAGMA loki_refresh_labels [('db')]` or by an opt-in `label_cache_ttl` (default: off).
+Catalog enumeration (autocomplete, `information_schema`) is served entirely from that snapshot,
+never a live Loki call per lookup.
+
+**`series` does not page.** Loki's `/series` accepts neither a limit nor a cursor, so the table
+is a single-shot enumeration held in memory; `series_max_rows` (default 100000) caps it and the
+scan errors past that rather than ballooning. The real control is a narrower selector or window.
+
+**Scope:** read-only. No `INSERT`/`CREATE`/`DROP` against Loki; the transaction manager is a
+trivial read-only stub. Note that DuckDB bumps an `http(s)://` attach path to `READ_ONLY` access
+mode on its own (it counts as a remote file), so that form is refused by DuckDB's own guard
+before reaching the catalog; the secret-name form keeps `READ_WRITE` mode and is refused by the
+catalog's stubs. Both paths error, with different messages.
 
 **Cost:** this is the largest, most DuckDB-version-coupled chunk of C++ in the project
 (`StorageExtension`, `Catalog`, `SchemaCatalogEntry`, `TableCatalogEntry`, attach hooks).
@@ -422,8 +440,15 @@ Pin dependency versions in `vcpkg.json`. Keep the binary small — the C-API not
 - **Unit tests** (no network): LogQL builder, request builder, filter translator (assert
   which predicates become matchers/bounds/line-filters vs residuals), and response parser
   against captured JSON fixtures.
-- **sqllogictest** (`test/sql/*.test`, from the template): end-to-end SQL against a mock
-  HTTP server returning canned Loki payloads — deterministic, no real Loki.
+- **sqllogictest** (`test/sql/*.test`, from the template), split by whether a server is needed:
+  - *server-backed* (`loki_mock.test`, `loki_attach.test`): end-to-end SQL against a mock HTTP
+    server returning canned Loki payloads — deterministic, no real Loki. Gated by
+    `require-env LOKI_MOCK_URL`, so `test/mock/run.sh` is what runs them; **every mock-gated
+    file must be in that script's default list, or it runs nowhere** (CI invokes it bare).
+  - *offline* (`loki.test`, `loki_attach_offline.test`): bind/DESCRIBE/catalog/error paths that
+    touch no socket, so they run under a plain `make test`. `ATTACH` with an explicit `labels`
+    skips discovery, which is what lets the catalog's read-only enforcement, enumeration,
+    default-schema resolution, and option surface be covered without a server.
 - **Integration** (CI, optional job): `docker compose` with a real Loki + a log generator;
   push known lines, assert selector/time/line-filter pushdown returns exactly them.
 - **Correctness fuzzing:** for a sampling of predicates, compare `loki()` (pushdown) vs
@@ -461,9 +486,10 @@ Pin dependency versions in `vcpkg.json`. Keep the binary small — the C-API not
   messages; README (document the §3.5 view trick for "logs as a table"); docker integration
   test.
 - **v1.0 — publish:** cross-platform CI green; `description.yaml`; community-extensions PR.
-- **v1.1 — `ATTACH` (§3.6):** `StorageExtension` + catalog exposing a single `logs` table
-  per tenant-schema, backed by the v0.4 pushdown core. The big DB-feel upgrade, deliberately
-  after the core is proven.
+- **v1.1 — `ATTACH` (§3.6) — DELIVERED:** `StorageExtension` + catalog exposing `logs`
+  (plus `labels`/`series`) per tenant-schema, backed by the v0.4 pushdown core; read-only stubs;
+  label auto-discovery with `PRAGMA loki_refresh_labels` and an opt-in `label_cache_ttl` (§11.8).
+  The big DB-feel upgrade, deliberately after the core was proven.
 - **Stretch:** metric queries; parallel sharded reads; auto label-column discovery; tail;
   multi-tenant schemas and optional `labels`/`series` catalog tables.
 
@@ -484,16 +510,54 @@ Pin dependency versions in `vcpkg.json`. Keep the binary small — the C-API not
    headers)? Grafana Cloud uses basic auth (user = tenant id, password = token).
 6. **Metric queries** — confirm out of scope for v1; sketch `loki_metric_query` shape for
    later so the schema doesn't paint us into a corner.
-7. **`ATTACH` bare-scan behavior (§3.6)** — when `SELECT * FROM loki.logs` has no pushable
-   selector, hard-error vs. apply a default permissive selector like `{job=~".+"}`? (Leaning
-   hard-error with a message that names the fix, to avoid silently expensive full scans.)
-8. **Label-column staleness** — cache TTL for `/labels`, and how to refresh (re-`ATTACH`,
-   a `PRAGMA`, or time-based)?
-9. **Auto label-column discovery — DECIDED (v1.0).** Keep `labels := [...]` as the permanent,
-   explicit way to promote label columns; an **absent** `labels` promotes **no** columns and
-   that default schema is the frozen published contract. Auto-discovery ships (if at all) as an
-   **opt-in sentinel** (`labels := '*'`), never by making absent-`labels` auto-discover — that
-   would break every existing `SELECT *` and tie the schema to live Loki state. See §4.2.
+7. **`ATTACH` bare-scan behavior — DECIDED (v1.1): hard error.** A scan with no pushable
+   selector raises a message naming the fix, rather than substituting a permissive
+   `{job=~".+"}` that would silently issue an expensive full scan. Enforced for both `logs`
+   and `series`, at scan start, before any network call.
+8. **Label-column staleness — DECIDED (v1.1).** The label set is snapshotted at attach time.
+   Two refresh paths, because they serve different needs:
+   - **`PRAGMA loki_refresh_labels`** (all attached loki databases) or
+     **`loki_refresh_labels('db')`** (one) — explicit, blocking, and errors surface to the
+     caller who asked. Naming a database attached with an explicit `labels` reports that its
+     columns are pinned; the bare form skips such databases instead of failing.
+   - **`label_cache_ttl`** ATTACH option — time-based, checked once per transaction start.
+     **Default `0` = disabled**, because a nonzero default would put a blocking HTTP call on
+     the bind path of ordinary queries and mutate a user's schema mid-session. Rejected
+     alongside an explicit `labels`, which pins the columns. On failure the previous snapshot
+     is kept and the refresh backed off (≥60s): an unreachable Loki must never make an
+     already-attached database unqueryable.
+
+   **Mechanics.** A refresh changes the promoted columns, hence the `logs`/`series` column
+   lists — which are fixed at `TableCatalogEntry` construction and read concurrently by binders
+   and by `information_schema`/`duckdb_columns()` scans *at execution time*. So the catalog
+   never mutates entries: it publishes a new immutable **snapshot** (generation) and each
+   transaction **pins** the one current when it started, in `StartTransaction` — which fires
+   exactly once per (transaction, attached database), so one statement can never straddle two
+   generations. Superseded generations are freed once no transaction holds them. A refresh that
+   finds the label set unchanged publishes nothing, so a periodic TTL does not churn catalog
+   oids. `Catalog::GetCatalogVersion` is deliberately **left unimplemented**: the base returns an
+   invalid `optional_idx`, which makes `PreparedStatementData::RequireRebind` always true for
+   this catalog (`duckdb/src/main/prepared_statement_data.cpp:25-39`) — free, provably-correct
+   invalidation, versus plan caching worth nothing next to an HTTP round-trip.
+
+   **Known consequence:** a refresh that adds a column invalidates views defined as `SELECT *`
+   over `logs` ("Contents of view were altered"), and `duckdb_tables().table_oid` changes.
+9. **Auto label-column discovery — DECIDED (v1.0), and it differs per entry point.**
+   - **`loki()` / `loki_scan()`: never auto-discover.** `labels := [...]` is the permanent,
+     explicit way to promote columns; an **absent** `labels` promotes **no** columns, and that
+     default schema is the frozen published contract. Auto-discovery ships (if at all) as an
+     **opt-in sentinel** (`labels := '*'`), never by making absent-`labels` auto-discover — that
+     would break every existing `SELECT *` and tie the schema to live Loki state. See §4.2.
+   - **`ATTACH`: absent `labels` *does* auto-discover** (§3.6). The reasoning above does not
+     transfer: ATTACH has no per-query argument list, so "promote nothing by default" would make
+     a bare `ATTACH` expose no pushable column at all — and, given the mandatory-selector rule
+     (§4.3), no runnable query. There is also no published `SELECT *` contract to break, since
+     the schema is established at attach time. `labels [...]` pins the columns and `labels []`
+     opts out, so the deterministic behavior remains one option away. The staleness this
+     introduces is what §11.8 answers.
+
+   This split is deliberate: the frozen default belongs to the *table functions*, whose schema is
+   a published API; the catalog's schema is per-attach state.
 
 ---
 

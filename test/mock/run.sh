@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
 # Mock-HTTP sqllogictest harness (DESIGN.md §8): start the deterministic Loki mock, point the
-# sqllogictest at it via ${LOKI_MOCK_URL}, run test/sql/loki_mock.test through DuckDB's unittest
-# runner, then tear the mock down. No Docker, no real Loki — fast and deterministic.
+# sqllogictests at it via ${LOKI_MOCK_URL}, run them through DuckDB's unittest runner, then tear
+# the mock down. No Docker, no real Loki — fast and deterministic.
 #
-# The test file is gated by `require-env LOKI_MOCK_URL`, so a plain `make test` skips it; this
-# script is the only thing that sets the var and thus actually runs it.
+# Those test files are gated by `require-env LOKI_MOCK_URL`, so a plain `make test` skips them;
+# this script is the only thing that sets the var and thus actually runs them. (The offline ATTACH
+# coverage in test/sql/loki_attach_offline.test needs no mock and runs under `make test`.)
 #
 # Requires: python3, and a built extension + test runner. Override with env vars:
 #   UNITTEST   path to the DuckDB test runner   (default: <repo>/build/release/test/unittest)
@@ -58,11 +59,16 @@ for _ in $(seq 1 50); do
 done
 [[ -n "$ready" ]] || { echo "mock server did not become ready at $LOKI_MOCK_URL" >&2; exit 1; }
 
-echo "==> Running mock sqllogictest"
-# Optional args: one or more test files to run (default: the full mock suite). Lets the same
-# harness drive test/sql/loki_attach.test (ATTACH catalog, DESIGN.md §3.6) etc.
-if [[ $# -gt 0 ]]; then
-	"$UNITTEST" --test-dir "$REPO_ROOT" "$@"
-else
-	"$UNITTEST" --test-dir "$REPO_ROOT" test/sql/loki_mock.test
+# Optional args: one or more test files to run. The default is every mock-gated suite — CI invokes
+# this script with no arguments (.github/workflows/Smoke.yml), so anything omitted here runs nowhere.
+TESTS=("$@")
+if [[ ${#TESTS[@]} -eq 0 ]]; then
+	TESTS=(test/sql/loki_mock.test test/sql/loki_attach.test)
 fi
+
+# One invocation per file: the unittest runner takes a single filter and silently concatenates
+# extra positional args into one unmatchable string.
+for test_file in "${TESTS[@]}"; do
+	echo "==> Running mock sqllogictest: $test_file"
+	"$UNITTEST" --test-dir "$REPO_ROOT" "$test_file"
+done

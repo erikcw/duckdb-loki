@@ -5,9 +5,11 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/atomic.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/transaction/transaction.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
@@ -30,6 +32,15 @@ struct LokiCatalogConfig {
 	std::string endpoint;            // trimmed Loki base URL
 	loki::AuthConfig auth;           // base auth (token/basic/headers); tenant filled in per-schema
 	std::vector<LokiTenant> tenants; // ≥1; single {"public", <tenant option>, <labels>} by default
+	// ATTACH passed an explicit `labels` list: the promoted columns are pinned, so there is nothing
+	// to discover and nothing to refresh.
+	bool labels_pinned = false;
+	// How long a discovered label set may be reused before the next statement re-fetches it
+	// (DESIGN.md §11.8). 0 — the default — disables time-based refresh entirely, leaving
+	// PRAGMA loki_refresh_labels as the only way to pick up new labels.
+	int64_t label_cache_ttl_ns = 0;
+	// Cap on the `series` table's single-shot enumeration (DESIGN.md §3.6).
+	idx_t series_max_rows = 100000;
 };
 
 class LokiSchemaEntry;
@@ -37,12 +48,54 @@ class LokiLogsTable;
 class LokiLabelsTable;
 class LokiSeriesTable;
 
+// One generation of the catalog's schema tree, immutable once published.
+//
+// A label refresh (DESIGN.md §11.8) changes the promoted label columns, and therefore the `logs`
+// and `series` column lists — which are fixed at TableCatalogEntry construction and are read
+// concurrently by binders and by information_schema/duckdb_columns() scans at execution time.
+// Mutating them in place would be a data race, so a refresh builds a whole new snapshot and swaps
+// it in; readers keep using the generation they started with.
+struct LokiCatalogSnapshot {
+	idx_t version = 0;
+	std::vector<std::vector<std::string>> label_columns; // parallel to LokiCatalogConfig::tenants
+	vector<unique_ptr<LokiSchemaEntry>> schemas;
+};
+
+// A transaction over the loki catalog. It pins the snapshot current when it started, so every
+// lookup within one statement — or one BEGIN…COMMIT — sees a single, stable set of catalog
+// entries even if a refresh publishes a new generation meanwhile.
+class LokiTransaction : public Transaction {
+public:
+	LokiTransaction(TransactionManager &manager, ClientContext &context,
+	                shared_ptr<const LokiCatalogSnapshot> snapshot_p)
+	    : Transaction(manager, context), snapshot(std::move(snapshot_p)) {
+	}
+
+	shared_ptr<const LokiCatalogSnapshot> snapshot;
+};
+
 // A read-only catalog exposing a Loki instance as an attached database. The `logs` table's scan is
 // backed by the same pushdown core as loki() — the catalog is a thin adapter (DESIGN.md §3.6).
 class LokiCatalog : public Catalog {
 public:
 	LokiCatalog(AttachedDatabase &db, LokiCatalogConfig config);
 	~LokiCatalog() override;
+
+	// Take a reference on the currently published snapshot, for a transaction to hold onto.
+	shared_ptr<const LokiCatalogSnapshot> PinCurrentSnapshot();
+
+	// TTL path (DESIGN.md §11.8): re-fetch the label set if `label_cache_ttl` has elapsed. Called
+	// once per transaction start. A failure here is swallowed and backed off — an unreachable Loki
+	// must not make an already-attached database unqueryable — so the old snapshot stays live.
+	//
+	// It must never call Transaction::Get or Catalog::GetCatalogTransaction: it runs while
+	// MetaTransaction::lock is held, and re-entering GetTransaction would self-deadlock.
+	void MaybeRefreshLabels(ClientContext &context);
+	// PRAGMA path: re-fetch now, blocking, and let failures surface to the user who asked.
+	void RefreshLabels(ClientContext &context);
+	bool LabelsPinned() const {
+		return config.labels_pinned;
+	}
 
 	void Initialize(bool load_builtin) override;
 	string GetCatalogType() override {
@@ -78,8 +131,31 @@ public:
 	string GetDefaultSchema() const override;
 
 private:
+	// Build a generation from a per-tenant label-column list (parallel to config.tenants).
+	shared_ptr<const LokiCatalogSnapshot> BuildSnapshot(std::vector<std::vector<std::string>> labels, idx_t version);
+	// The snapshot a read should use: the one pinned by this transaction, else the published one.
+	// Returned by value so the caller's use cannot race a concurrent swap.
+	shared_ptr<const LokiCatalogSnapshot> PinnedSnapshot(optional_ptr<Transaction> transaction);
+	// Fetch every tenant's labels and, if they differ from the current generation, publish a new
+	// one. All-or-nothing: a tenant that fails aborts the whole refresh rather than publishing a
+	// half-updated catalog. Returns true when a new generation was published. Caller holds
+	// `refresh_lock`; throws on any transport/parse failure.
+	bool DoRefresh(bool short_timeouts);
+
+	// Immutable after attach: endpoint, auth, and the tenant list. Only the tenants' *label columns*
+	// can change (on refresh), and those live in the snapshot — so this needs no lock.
 	LokiCatalogConfig config;
-	vector<unique_ptr<LokiSchemaEntry>> schemas;
+
+	mutex snapshot_lock;
+	shared_ptr<const LokiCatalogSnapshot> current;
+	// Superseded generations, kept alive until no transaction holds them (pins are only ever taken
+	// from `current`, so use_count()==1 here proves nobody is reading it).
+	vector<shared_ptr<const LokiCatalogSnapshot>> retired;
+
+	// Serialises the refresh HTTP round-trip. Never held together with `snapshot_lock`.
+	mutex refresh_lock;
+	// Wall-clock ns after which the TTL path should re-fetch; also carries the failure backoff.
+	atomic<int64_t> next_check_ns;
 };
 
 // One schema per tenant, holding the fixed `logs` table (DESIGN.md §3.6).
@@ -177,7 +253,7 @@ private:
 class LokiSeriesTable : public TableCatalogEntry {
 public:
 	LokiSeriesTable(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info, std::string endpoint,
-	                loki::AuthConfig auth, std::vector<std::string> label_columns);
+	                loki::AuthConfig auth, std::vector<std::string> label_columns, idx_t max_rows);
 
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override {
 		return nullptr;
@@ -197,6 +273,7 @@ private:
 	std::string endpoint;
 	loki::AuthConfig auth;
 	std::vector<std::string> label_columns;
+	idx_t max_rows;
 };
 
 // A trivial read-only transaction manager: the Loki catalog never mutates, so transactions carry
@@ -204,7 +281,7 @@ private:
 // DuckCatalog.)
 class LokiTransactionManager : public TransactionManager {
 public:
-	explicit LokiTransactionManager(AttachedDatabase &db) : TransactionManager(db) {
+	LokiTransactionManager(AttachedDatabase &db, LokiCatalog &catalog_p) : TransactionManager(db), catalog(catalog_p) {
 	}
 	Transaction &StartTransaction(ClientContext &context) override;
 	ErrorData CommitTransaction(ClientContext &context, Transaction &transaction) override;
@@ -212,11 +289,15 @@ public:
 	void Checkpoint(ClientContext &context, bool force) override;
 
 private:
+	// Safe to hold by reference: AttachedDatabase declares `catalog` before `transaction_manager`,
+	// so the manager is destroyed first.
+	LokiCatalog &catalog;
 	mutex transaction_lock;
 	reference_map_t<Transaction, unique_ptr<Transaction>> transactions;
 };
 
-// Register the `loki` storage extension so `ATTACH ... (TYPE loki)` works (DESIGN.md §3.6).
-void RegisterLokiStorageExtension(DBConfig &config);
+// Register the `loki` storage extension so `ATTACH ... (TYPE loki)` works (DESIGN.md §3.6), plus
+// `PRAGMA loki_refresh_labels [('db')]` for re-discovering label columns (DESIGN.md §11.8).
+void RegisterLokiStorageExtension(ExtensionLoader &loader);
 
 } // namespace duckdb

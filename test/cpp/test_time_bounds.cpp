@@ -7,6 +7,7 @@
 #include <stdexcept>
 
 using duckdb::loki::IntervalToNanos;
+using duckdb::loki::ParseDurationToNanos;
 using duckdb::loki::TryAddNanos;
 using duckdb::loki::TryMultiplyNanos;
 
@@ -69,4 +70,53 @@ TEST_CASE("an interval too large for the nanosecond range is rejected") {
 		threw = true;
 	}
 	CHECK(threw);
+}
+
+//===--------------------------------------------------------------------===//
+// ParseDurationToNanos — the ATTACH `label_cache_ttl` option (DESIGN.md §11.8)
+//===--------------------------------------------------------------------===//
+
+static constexpr int64_t SEC = 1000000000LL;
+
+TEST_CASE("duration suffixes scale correctly") {
+	CHECK_EQ(ParseDurationToNanos("0"), int64_t(0));
+	CHECK_EQ(ParseDurationToNanos("300"), int64_t(300 * SEC)); // bare number = seconds
+	CHECK_EQ(ParseDurationToNanos("30s"), int64_t(30 * SEC));
+	CHECK_EQ(ParseDurationToNanos("500ms"), int64_t(SEC / 2));
+	CHECK_EQ(ParseDurationToNanos("5m"), int64_t(300 * SEC));
+	CHECK_EQ(ParseDurationToNanos("1h"), int64_t(3600 * SEC));
+	CHECK_EQ(ParseDurationToNanos("2d"), int64_t(2 * 86400 * SEC));
+}
+
+TEST_CASE("duration parsing tolerates whitespace and suffix case") {
+	CHECK_EQ(ParseDurationToNanos("  5m "), int64_t(300 * SEC));
+	CHECK_EQ(ParseDurationToNanos("1H"), int64_t(3600 * SEC));
+	CHECK_EQ(ParseDurationToNanos("250MS"), int64_t(SEC / 4));
+}
+
+static bool DurationRejected(const char *text) {
+	try {
+		ParseDurationToNanos(text);
+	} catch (const std::invalid_argument &) {
+		return true;
+	} catch (const std::out_of_range &) {
+		return true;
+	}
+	return false;
+}
+
+TEST_CASE("malformed durations are rejected, not silently coerced") {
+	CHECK(DurationRejected(""));
+	CHECK(DurationRejected("   "));
+	CHECK(DurationRejected("m"));    // no number
+	CHECK(DurationRejected("-5s"));  // negative: a TTL cannot run backwards
+	CHECK(DurationRejected("5 m"));  // inner whitespace
+	CHECK(DurationRejected("5min")); // not one of the accepted suffixes
+	CHECK(DurationRejected("1.5h")); // fractions unsupported — use 90m
+	CHECK(DurationRejected("5s junk"));
+}
+
+TEST_CASE("a duration past the nanosecond range is rejected instead of wrapping") {
+	CHECK(DurationRejected("999999999999999999999d"));
+	CHECK(DurationRejected("9223372036854775807d"));
 }

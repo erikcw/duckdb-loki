@@ -198,3 +198,106 @@ statement error
 ATTACH '${LOKI_MOCK_URL}' AS badlabel (TYPE loki, labels ['job"} |= "pwned']);
 ----
 invalid label name
+
+# ============================================================================================
+# Label-cache refresh (DESIGN.md §11.8). The mock rotates its label set when asked for the
+# values of the magic label `__rotate__`, after which GET /labels also reports `rotated`.
+# This section must come last: the rotation is global to the mock process.
+# ============================================================================================
+
+# Two databases over the same Loki: one with a TTL short enough to expire between statements,
+# one with the default (no time-based refresh at all).
+statement ok
+ATTACH '${LOKI_MOCK_URL}' AS ttlrf (TYPE loki, label_cache_ttl '1ms');
+
+statement ok
+ATTACH '${LOKI_MOCK_URL}' AS rf (TYPE loki);
+
+query II
+SELECT
+  (SELECT count(*) FROM (DESCRIBE ttlrf.public.logs) WHERE column_name = 'rotated'),
+  (SELECT count(*) FROM (DESCRIBE rf.public.logs) WHERE column_name = 'rotated');
+----
+0	0
+
+# Make the server grow a new label.
+query I
+SELECT count(*) FROM loki_label_values('__rotate__', endpoint := '${LOKI_MOCK_URL}');
+----
+1
+
+# The TTL database picks it up on its next statement...
+query I
+SELECT count(*) FROM (DESCRIBE ttlrf.public.logs) WHERE column_name = 'rotated';
+----
+1
+
+# ...while the default database keeps the generation it attached with. A schema that changes
+# under a running session is exactly what the TTL opt-in is for.
+query I
+SELECT count(*) FROM (DESCRIBE rf.public.logs) WHERE column_name = 'rotated';
+----
+0
+
+statement ok
+PRAGMA loki_refresh_labels('rf');
+
+query I
+SELECT count(*) FROM (DESCRIBE rf.public.logs) WHERE column_name = 'rotated';
+----
+1
+
+# The freshly promoted column is a real pushdown column, not just a name in the schema.
+query I
+SELECT line FROM rf.public.logs WHERE rotated = '__echo__';
+----
+{rotated="__echo__"}
+
+# Refreshing again with nothing changed is a no-op — it must not churn the schema.
+statement ok
+PRAGMA loki_refresh_labels('rf');
+
+query I
+SELECT count(*) FROM (DESCRIBE rf.public.logs) WHERE column_name = 'rotated';
+----
+1
+
+# The bare form refreshes every attached loki database.
+statement ok
+PRAGMA loki_refresh_labels;
+
+# Now break GET /labels on the server. A TTL refresh that fails must be swallowed: the
+# previously discovered schema keeps serving queries rather than the database going dark.
+query I
+SELECT count(*) FROM loki_label_values('__break_labels__', endpoint := '${LOKI_MOCK_URL}');
+----
+1
+
+query I
+SELECT count(*) FROM (DESCRIBE ttlrf.public.logs) WHERE column_name = 'rotated';
+----
+1
+
+query I
+SELECT line FROM ttlrf.public.logs WHERE rotated = '__echo__';
+----
+{rotated="__echo__"}
+
+# An explicit PRAGMA, by contrast, reports the failure to the user who asked for it.
+statement error
+PRAGMA loki_refresh_labels('rf');
+----
+label auto-discovery got HTTP 500
+
+statement ok
+DETACH ttlrf;
+
+statement ok
+DETACH rf;
+
+# A Loki that is unreachable at ATTACH time fails the ATTACH outright — auto-discovery is
+# what determines the schema, so there is nothing sensible to fall back to.
+statement error
+ATTACH 'http://127.0.0.1:1' AS dead (TYPE loki);
+----
+label auto-discovery request to Loki failed

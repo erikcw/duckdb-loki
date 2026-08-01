@@ -25,7 +25,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// The `loki` storage extension (DESIGN.md §3.6, roadmap v1.1): ATTACH ... (TYPE loki) exposes
 	// Loki as a read-only attached database whose `logs` table reuses the pushdown scan core.
-	RegisterLokiStorageExtension(DBConfig::GetConfig(loader.GetDatabaseInstance()));
+	// Also registers PRAGMA loki_refresh_labels (DESIGN.md §11.8).
+	RegisterLokiStorageExtension(loader);
 }
 
 void LokiExtension::Load(ExtensionLoader &loader) {

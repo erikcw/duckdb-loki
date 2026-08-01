@@ -4,6 +4,7 @@
 #include "loki/connection.hpp"
 #include "loki/http_client.hpp"
 #include "loki/http_request.hpp"
+#include "loki/loki_scan.hpp"
 #include "loki/parse.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -126,15 +127,6 @@ unique_ptr<GlobalTableFunctionState> LokiDiscoveryInitGlobal(ClientContext &cont
 	return make_uniq<LokiDiscoveryGlobalState>(bind_data.endpoint, std::move(headers), bind_data.request);
 }
 
-// Build a MAP(VARCHAR, VARCHAR) Value from a label set.
-Value MapFromStrings(const std::map<std::string, std::string> &m) {
-	InsertionOrderPreservingMap<string> ordered;
-	for (const auto &kv : m) {
-		ordered.insert(kv.first, kv.second);
-	}
-	return Value::MAP(ordered);
-}
-
 // Issue the single discovery request and parse it into the appropriate buffer. Errors surface the
 // Loki status and body, matching the scan path.
 void FetchDiscovery(LokiDiscoveryGlobalState &state, DiscoveryKind kind, const char *fn) {
@@ -174,7 +166,7 @@ void LokiDiscoveryFunction(ClientContext &context, TableFunctionInput &data_p, D
 	idx_t count = 0;
 	if (bind_data.kind == DiscoveryKind::SERIES) {
 		while (count < STANDARD_VECTOR_SIZE && state.offset < state.series_rows.size()) {
-			output.data[0].SetValue(count, MapFromStrings(state.series_rows[state.offset]));
+			output.data[0].SetValue(count, LokiMapFromStrings(state.series_rows[state.offset]));
 			state.offset++;
 			count++;
 		}
