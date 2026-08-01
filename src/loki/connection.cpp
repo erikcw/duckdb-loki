@@ -210,15 +210,27 @@ void ResolveLokiConnectionFromOptions(ClientContext &context, const std::string 
 		return &it->second;
 	};
 
+	// An optional `loki:` prefix is stripped before the path is classified at all. DuckDB gates
+	// ATTACH on any path that *looks* like a remote file: DatabaseManager::AttachDatabase maps the
+	// `http://` prefix to httpfs and throws MissingExtensionException unless that extension can be
+	// loaded — before the storage extension is ever consulted, so `TYPE loki` does not exempt us,
+	// even though we do our own HTTP and never touch httpfs. `ATTACH 'loki:http://host'` hides the
+	// URL from that check (the same shape as `ducklake:`), which is also what makes the ATTACH
+	// suite runnable in CI, where no extension is installed.
+	std::string bare_path = path;
+	if (StringUtil::StartsWith(StringUtil::Lower(path), "loki:")) {
+		bare_path = path.substr(5);
+	}
+
 	// An http(s):// path is the endpoint; any other non-empty path is a secret name (unless a
 	// `secret` option overrides it). This mirrors the two ATTACH forms in DESIGN.md §3.6.
-	std::string lower_path = StringUtil::Lower(path);
+	std::string lower_path = StringUtil::Lower(bare_path);
 	bool path_is_url = StringUtil::StartsWith(lower_path, "http://") || StringUtil::StartsWith(lower_path, "https://");
 	std::string secret_name;
 	if (auto *p = opt("secret")) {
 		secret_name = p->ToString();
-	} else if (!path_is_url && !path.empty()) {
-		secret_name = path;
+	} else if (!path_is_url && !bare_path.empty()) {
+		secret_name = bare_path;
 	}
 
 	// The endpoint this ATTACH names, resolved before the secret lookup so it can be the lookup
@@ -228,7 +240,7 @@ void ResolveLokiConnectionFromOptions(ClientContext &context, const std::string 
 	if (auto *p = opt("endpoint")) {
 		inline_endpoint = p->ToString();
 	} else if (path_is_url) {
-		inline_endpoint = path;
+		inline_endpoint = bare_path;
 	}
 
 	auto &secret_manager = SecretManager::Get(context);
@@ -252,7 +264,7 @@ void ResolveLokiConnectionFromOptions(ClientContext &context, const std::string 
 
 	// Inline overrides take precedence over the secret (a URL path counts as an endpoint override).
 	if (path_is_url) {
-		endpoint = path;
+		endpoint = bare_path;
 	}
 	if (auto *p = opt("endpoint")) {
 		endpoint = p->ToString();
@@ -276,8 +288,10 @@ void ResolveLokiConnectionFromOptions(ClientContext &context, const std::string 
 	auth.extra_headers = std::move(secret_headers);
 
 	if (endpoint.empty()) {
-		throw BinderException("%s requires an endpoint: ATTACH an http(s):// URL, pass ENDPOINT, or reference a "
-		                      "loki secret (SECRET 'my_loki', or a default CREATE SECRET (TYPE loki, ENDPOINT ...))",
+		throw BinderException("%s requires an endpoint: ATTACH an http(s):// URL (optionally written "
+		                      "'loki:http://...', which avoids DuckDB's httpfs requirement for remote paths), pass "
+		                      "ENDPOINT, or reference a loki secret (SECRET 'my_loki', or a default CREATE SECRET "
+		                      "(TYPE loki, ENDPOINT ...))",
 		                      fn);
 	}
 	while (!endpoint.empty() && endpoint.back() == '/') {

@@ -82,9 +82,10 @@ assert_error "loki() mandatory-selector error" "stream selector is required" \
 	"SELECT * FROM loki(endpoint := 'http://localhost:3100');"
 
 # The storage extension is registered by the loadable binary: ATTACH ... (TYPE loki) builds the
-# catalog offline when `labels` is explicit (no auto-discovery round-trip).
+# catalog offline when `labels` is explicit (no auto-discovery round-trip). The `loki:` prefix keeps
+# this off the network: a bare http:// path would make the stock CLI go install httpfs first.
 assert "ATTACH (TYPE loki) exposes the three catalog tables" 3 \
-	"ATTACH 'http://localhost:3100' AS lk (TYPE loki, labels ['job']); SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lk';"
+	"ATTACH 'loki:http://localhost:3100' AS lk (TYPE loki, labels ['job']); SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lk';"
 
 # PRAGMA loki_refresh_labels registers alongside the storage extension (DESIGN.md §11.8). Both
 # overloads must be present — a name conflict at LOAD time would surface here.

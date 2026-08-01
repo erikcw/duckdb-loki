@@ -185,7 +185,7 @@ instead of by table function:
 ```sql
 ATTACH 'my_loki' AS lk (TYPE loki);          -- 'my_loki' names a loki secret
 -- or inline:
-ATTACH 'https://logs.example.net' AS lk (TYPE loki, TOKEN 'glc_...', TENANT '1234');
+ATTACH 'loki:https://logs.example.net' AS lk (TYPE loki, TOKEN 'glc_...', TENANT '1234');
 
 SELECT timestamp, line
 FROM lk.public.logs
@@ -193,6 +193,13 @@ WHERE job = 'api' AND level = 'error'
   AND timestamp >= TIMESTAMP '2026-07-04 00:00:00'
   AND line LIKE '%timeout%';
 ```
+
+> **Why `loki:` in front of the URL?** DuckDB treats any `ATTACH` path starting with `http://` or
+> `https://` as a remote *file* and refuses it unless the **httpfs** extension can be loaded — a
+> check that happens before `TYPE loki` is looked at, even though this extension does its own HTTP
+> and never uses httpfs. The `loki:` prefix (in the spirit of `ducklake:`) keeps the URL out of that
+> check. Writing the bare URL also works wherever httpfs is installed or auto-installable, and there
+> it additionally makes DuckDB mark the database read-only for you.
 
 The catalog is `database` → `schema` (one per tenant) → a small **fixed** set of tables:
 
@@ -329,7 +336,12 @@ script runs them. Needs only `python3`:
 
 The `ATTACH` surfaces that need no server — read-only enforcement, catalog enumeration,
 default-schema resolution, and the option surface — live in `test/sql/loki_attach_offline.test`
-and run under a plain `make test`.
+and run under a plain `make test`. The one form that cannot run there is the bare-`http://` attach
+path, which DuckDB gates on httpfs; it lives in `test/sql/loki_attach_httpfs.test` and is skipped
+unless you ask for extension autoloading:
+```sh
+./build/release/test/unittest --autoloading all --test-dir . test/sql/loki_attach_httpfs.test
+```
 
 All of the above drive a build with the extension **statically linked in**. To smoke-test the
 actual shipped **loadable binary**, `./test/loadable` `LOAD`s it into a *stock* DuckDB CLI (one

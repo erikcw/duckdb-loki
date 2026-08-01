@@ -20,7 +20,7 @@ require loki
 # ============================================================================================
 
 statement ok
-ATTACH '${LOKI_MOCK_URL}' AS lk (TYPE loki, labels ['job', 'level']);
+ATTACH 'loki:${LOKI_MOCK_URL}' AS lk (TYPE loki, labels ['job', 'level']);
 
 # The single fixed schema is `public`, holding one `logs` table.
 query I
@@ -99,12 +99,25 @@ SELECT line FROM lk3.public.logs WHERE job = '__echo__';
 statement ok
 DETACH lk3;
 
+# An explicit ENDPOINT beats the URL in the path. Only a live query can tell the two apart, so the
+# path here points at a dead port: reaching the mock at all proves the option won.
+statement ok
+ATTACH 'loki:http://127.0.0.1:1' AS ovr (TYPE loki, labels ['job'], ENDPOINT '${LOKI_MOCK_URL}');
+
+query I
+SELECT line FROM ovr.public.logs WHERE job = '__echo__';
+----
+{job="__echo__"}
+
+statement ok
+DETACH ovr;
+
 # ============================================================================================
 # Multi-tenant: one schema per `tenants` entry, each carrying its own X-Scope-OrgID.
 # ============================================================================================
 
 statement ok
-ATTACH '${LOKI_MOCK_URL}' AS mt (TYPE loki, tenants ['1', '2'], labels ['job']);
+ATTACH 'loki:${LOKI_MOCK_URL}' AS mt (TYPE loki, tenants ['1', '2'], labels ['job']);
 
 # Two tenant schemas exist (plus whatever system schemas duckdb_schemas lists for the db).
 query I
@@ -132,7 +145,7 @@ DETACH mt;
 # ============================================================================================
 
 statement ok
-ATTACH '${LOKI_MOCK_URL}' AS ad (TYPE loki);
+ATTACH 'loki:${LOKI_MOCK_URL}' AS ad (TYPE loki);
 
 # The auto-discovered label names became real columns on `logs` (timestamp, line, job, level,
 # pod, labels, structured_metadata).
@@ -182,7 +195,7 @@ DETACH ad;
 # An explicit empty `labels []` opts out of auto-discovery: no promoted columns, so a scan has
 # nothing to build a selector from and hard-errors (no /labels call is made).
 statement ok
-ATTACH '${LOKI_MOCK_URL}' AS noauto (TYPE loki, labels []);
+ATTACH 'loki:${LOKI_MOCK_URL}' AS noauto (TYPE loki, labels []);
 
 query I
 SELECT count(*) FROM (DESCRIBE noauto.public.logs) WHERE column_name NOT IN ('timestamp', 'line', 'labels', 'structured_metadata');
@@ -195,7 +208,7 @@ DETACH noauto;
 # An invalid label name in the explicit `labels` option is rejected: promoted names are
 # interpolated into the LogQL selector unescaped (docs/SECURITY-REVIEW.md #4).
 statement error
-ATTACH '${LOKI_MOCK_URL}' AS badlabel (TYPE loki, labels ['job"} |= "pwned']);
+ATTACH 'loki:${LOKI_MOCK_URL}' AS badlabel (TYPE loki, labels ['job"} |= "pwned']);
 ----
 invalid label name
 
@@ -208,10 +221,10 @@ invalid label name
 # Two databases over the same Loki: one with a TTL short enough to expire between statements,
 # one with the default (no time-based refresh at all).
 statement ok
-ATTACH '${LOKI_MOCK_URL}' AS ttlrf (TYPE loki, label_cache_ttl '1ms');
+ATTACH 'loki:${LOKI_MOCK_URL}' AS ttlrf (TYPE loki, label_cache_ttl '1ms');
 
 statement ok
-ATTACH '${LOKI_MOCK_URL}' AS rf (TYPE loki);
+ATTACH 'loki:${LOKI_MOCK_URL}' AS rf (TYPE loki);
 
 query II
 SELECT
@@ -298,6 +311,6 @@ DETACH rf;
 # A Loki that is unreachable at ATTACH time fails the ATTACH outright — auto-discovery is
 # what determines the schema, so there is nothing sensible to fall back to.
 statement error
-ATTACH 'http://127.0.0.1:1' AS dead (TYPE loki);
+ATTACH 'loki:http://127.0.0.1:1' AS dead (TYPE loki);
 ----
 label auto-discovery request to Loki failed

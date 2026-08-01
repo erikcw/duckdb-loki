@@ -1,0 +1,71 @@
+# name: test/sql/loki_attach_httpfs.test
+# description: ATTACH ... (TYPE loki) with a bare http(s):// path, the form DuckDB gates on httpfs.
+# group: [sql]
+
+#
+# DuckDB classifies an `http://` ATTACH path as a remote file (FileSystem::IsRemoteFile) and, in
+# DatabaseManager::AttachDatabase, refuses it with a MissingExtensionException unless httpfs can be
+# loaded — before the storage extension is consulted at all, so `TYPE loki` does not exempt it. The
+# extension speaks HTTP itself and never calls into httpfs; `ATTACH 'loki:http://...'` (covered by
+# test/sql/loki_attach_offline.test) is the form that sidesteps the gate entirely.
+#
+# What this file pins down is what the bare-URL form buys in exchange: DuckDB bumps a remote-file
+# attach to READ_ONLY access mode, so mutations are refused a layer above the catalog's own stubs.
+#
+# `require httpfs` skips the whole file unless the runner may load httpfs, and the runner disables
+# extension autoloading by default — so `make test` skips it everywhere, CI included. Opt in with:
+#
+#     ./build/release/test/unittest --autoloading all --test-dir . test/sql/loki_attach_httpfs.test
+#
+# which installs httpfs from the extension repository (needs network) and then runs the file.
+
+require loki
+
+require httpfs
+
+# Same dead endpoint as the offline suite: an explicit `labels` list suppresses attach-time
+# auto-discovery, so nothing here touches the network.
+statement ok
+ATTACH 'http://127.0.0.1:1' AS lk (TYPE loki, labels ['job', 'level']);
+
+# The path is the endpoint in this form too — the catalog is built and enumerable.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lk';
+----
+3
+
+# The bump: unlike a `loki:` path, this database is read-only to DuckDB itself.
+query I
+SELECT readonly FROM duckdb_databases() WHERE database_name = 'lk';
+----
+true
+
+statement error
+CREATE TABLE lk.public.t (i INTEGER);
+----
+read-only mode
+
+statement error
+DROP TABLE lk.public.logs;
+----
+read-only mode
+
+statement error
+CREATE SCHEMA lk.extra;
+----
+read-only mode
+
+statement ok
+DETACH lk;
+
+# https:// is classified the same way, and reaches the same endpoint handling.
+statement ok
+ATTACH 'https://127.0.0.1:1' AS sec (TYPE loki, labels ['job']);
+
+query I
+SELECT readonly FROM duckdb_databases() WHERE database_name = 'sec';
+----
+true
+
+statement ok
+DETACH sec;

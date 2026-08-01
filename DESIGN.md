@@ -185,7 +185,7 @@ autocomplete, multi-tenant schemas, and not having to hand-write the base select
 
 ```sql
 ATTACH 'my_loki' AS loki (TYPE loki);         -- 'my_loki' resolves a secret
--- or inline:  ATTACH 'https://logs.example.net' AS loki (TYPE loki, TOKEN '...', TENANT '1234');
+-- or inline:  ATTACH 'loki:https://logs.example.net' AS loki (TYPE loki, TOKEN '...', TENANT '1234');
 
 SELECT timestamp, line
 FROM loki.public.logs
@@ -193,6 +193,18 @@ WHERE job = 'api' AND level = 'error'
   AND timestamp >= now() - INTERVAL 2 HOUR
   AND line LIKE '%timeout%';
 ```
+
+**The attach path, and why `loki:` exists.** The path is either a secret name or an endpoint
+URL, with an optional `loki:` prefix stripped before that classification (so `loki:my_secret`
+and `loki:https://host` both work). The prefix is not cosmetic: `DatabaseManager::AttachDatabase`
+maps a path starting with `http(s)://` to the **httpfs** extension and throws
+`MissingExtensionException` unless it loads — before the storage extension is consulted, so
+`TYPE loki` grants no exemption, even though we hold our own HTTP client and never call httpfs.
+The prefix hides the URL from `FileSystem::IsRemoteFile`, exactly as `ducklake:` does. Two
+consequences worth knowing: a bare URL still works wherever httpfs is installed or
+auto-installable, and only the bare URL gets DuckDB's automatic `READ_ONLY` access-mode bump —
+for every other form the catalog's own read-only stubs are the guard (they always are; the bump
+merely refuses mutations one layer earlier).
 
 **Catalog structure (the supported mapping):**
 
@@ -448,7 +460,13 @@ Pin dependency versions in `vcpkg.json`. Keep the binary small — the C-API not
   - *offline* (`loki.test`, `loki_attach_offline.test`): bind/DESCRIBE/catalog/error paths that
     touch no socket, so they run under a plain `make test`. `ATTACH` with an explicit `labels`
     skips discovery, which is what lets the catalog's read-only enforcement, enumeration,
-    default-schema resolution, and option surface be covered without a server.
+    default-schema resolution, and option surface be covered without a server. These attach via
+    `loki:http://...`: the runner installs no extensions, so a bare URL would fail the httpfs
+    gate described in §3.6.
+  - *extension-gated* (`loki_attach_httpfs.test`): the bare-URL attach form, which by definition
+    needs httpfs. `require httpfs` plus the runner's default no-autoloading means it is skipped
+    by everything, CI included; run it deliberately with
+    `unittest --autoloading all --test-dir . test/sql/loki_attach_httpfs.test`.
 - **Integration** (CI, optional job): `docker compose` with a real Loki + a log generator;
   push known lines, assert selector/time/line-filter pushdown returns exactly them.
 - **Correctness fuzzing:** for a sampling of predicates, compare `loki()` (pushdown) vs
