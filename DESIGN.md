@@ -460,9 +460,32 @@ Pin dependency versions in `vcpkg.json`. Keep the binary small — the C-API not
 
 - Use the extension template's GitHub Actions to build for
   **Linux/macOS/Windows × amd64/arm64**.
-- Ship a `description.yaml` (metadata: name, description, version, repo, maintainers) and
-  submit a PR to **`duckdb/community-extensions`**; their pipeline builds and signs the
-  artifacts. After acceptance, users get it via `INSTALL loki FROM community; LOAD loki;`.
+- Publish by PR to **`duckdb/community-extensions`** adding a single
+  `extensions/loki/description.yml`; their pipeline builds and signs the artifacts. After
+  acceptance, users get it via `INSTALL loki FROM community; LOAD loki;`.
+  **That descriptor lives in their repo, not this one** — nothing here reads it, and a copy
+  kept here would drift, since descriptor-only edits (docs prose, function descriptions)
+  ship without a new tag on our side.
+  - `repo.ref` is the release: updating the descriptor triggers a rebuild, and every DuckDB
+    release rebuilds all community extensions. `extension.version` is display metadata only —
+    there is no way for users to install a previous ref, so a rebuild replaces the artifact
+    in place. Most descriptors pin a commit SHA; tags are also accepted (and must then never
+    be moved).
+  - Their build ignores our `duckdb/` submodule pin: `_extension_distribution.yml` runs
+    `make set_duckdb_version` with *their* `DUCKDB_VERSION`. Our pin only governs local and
+    our-CI builds.
+- **Generated docs page** (`duckdb.org/community_extensions/extensions/loki`) — one page, built
+  by `scripts/generate_md.sh` from the descriptor plus a catalog diff of the loaded binary
+  (`duckdb_extensions/functions/settings/types`, pre vs post `LOAD`). Consequences:
+  - `docs.hello_world` becomes the usage example, `docs.extended_description` the "About"
+    section. Everything beyond that page lives in our README, which they link.
+  - The diff only sees functions, settings and types — so **`ATTACH (TYPE loki)` and the `loki`
+    secret type are invisible to it** (a `StorageExtension` registers none of the three). They
+    are documented only where we write them by hand, i.e. the extended description.
+  - The generated function table renders `description`/`comment`/`examples` from
+    `duckdb_functions()`, which are empty for all of ours. Fill them via the optional
+    `extensions/loki/docs/function_descriptions.csv` in the same PR
+    (`function,function_type,description,comment,example`).
 - **License:** MIT (matches community-extension expectations and keeps it redistributable).
 - **README:** quickstart, secret setup, `loki` vs `loki_scan`, the pushdown table, and a
   worked "join Loki with a Parquet file" example — the join story is the headline feature.
@@ -485,7 +508,7 @@ Pin dependency versions in `vcpkg.json`. Keep the binary small — the C-API not
 - **v0.5 — discovery + polish:** `loki_labels`, `loki_label_values`, `loki_series`; error
   messages; README (document the §3.5 view trick for "logs as a table"); docker integration
   test.
-- **v1.0 — publish:** cross-platform CI green; `description.yaml`; community-extensions PR.
+- **v1.0 — publish:** cross-platform CI green; `description.yml`; community-extensions PR.
 - **v1.1 — `ATTACH` (§3.6) — DELIVERED:** `StorageExtension` + catalog exposing `logs`
   (plus `labels`/`series`) per tenant-schema, backed by the v0.4 pushdown core; read-only stubs;
   label auto-discovery with `PRAGMA loki_refresh_labels` and an opt-in `label_cache_ttl` (§11.8).

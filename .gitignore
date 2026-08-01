@@ -8,3 +8,8 @@ test/python/__pycache__/
 .Rhistory
 .serena/
 .cache/
+
+# Staging draft of the community-extensions descriptor. Its real home is
+# extensions/loki/description.yml in duckdb/community-extensions (see DESIGN.md §9);
+# tracking a copy here would only drift from the one that actually ships.
+/description.yml

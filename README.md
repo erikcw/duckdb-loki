@@ -5,13 +5,13 @@ with label/time/line-filter pushdown into LogQL, so you can join your logs again
 
 This repository is based on https://github.com/duckdb/extension-template.
 
-> **Status:** preparing the **v1.0** publish. Working end-to-end: the raw-LogQL
+> **Status:** preparing the **v1.1** publish. Working end-to-end: the raw-LogQL
 > `loki_scan()` function, the pushdown-driven `loki()` function (label/time/line-filter
 > pushdown into LogQL), promoted **label columns**, **projection pushdown**,
 > **structured metadata**, the `loki_labels` / `loki_label_values` / `loki_series` discovery
 > helpers, **secrets-based auth**, **automatic paging** over Loki's per-request cap, and
 > **`ATTACH`** — Loki as a read-only attached database. Targets DuckDB **v1.5.5**. Still to
-> come: the community-extensions submission (v1.0). See [`DESIGN.md`](./DESIGN.md) for the full
+> come: the community-extensions submission. See [`DESIGN.md`](./DESIGN.md) for the full
 > specification and roadmap.
 
 ## Usage
