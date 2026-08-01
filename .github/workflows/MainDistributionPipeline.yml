@@ -3,12 +3,26 @@
 #
 name: Main Extension Distribution Pipeline
 on:
+  # An unfiltered `push:` builds every ref that moves. Restricting it to main and release tags
+  # keeps a branch that also has an open PR from building twice (once as `push`, once as
+  # `pull_request`).
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
+# Group by commit, not by ref: cutting a release tag on a commit that is already building as a
+# main push would otherwise run the whole matrix a second time for identical output — the
+# tag-aware steps in _extension_distribution.yml are gated on `extension_tag`/`duckdb_tag`, which
+# this workflow does not pass. The tag run now supersedes the main run instead (which is left
+# CANCELLED in main's history — that entry is the duplicate we chose not to pay for).
+#
+# The trade-off: pushing several commits to main in quick succession no longer collapses into a
+# single run, since each commit is now its own group. That is more runner time, but every commit
+# on main gets built rather than only the last one.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
   cancel-in-progress: true
 
 jobs:
