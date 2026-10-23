@@ -60,6 +60,12 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto yyjson::yyjson)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto yyjson::yyjson)
 
+# Newer cpp-httplib loads the macOS system trust store, which pulls in CoreFoundation and Security.
+if(APPLE)
+  target_link_libraries(${EXTENSION_NAME} "-framework CoreFoundation" "-framework Security")
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} "-framework CoreFoundation" "-framework Security")
+endif()
+
 # cpp-httplib: add only its header directory (see the find_package note above for why we
 # intentionally avoid the httplib::httplib target and its interface compile definitions).
 target_include_directories(${EXTENSION_NAME} PRIVATE ${HTTPLIB_INCLUDE_DIR})
