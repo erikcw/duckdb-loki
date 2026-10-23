@@ -10,7 +10,7 @@ This repository is based on https://github.com/duckdb/extension-template.
 > pushdown into LogQL), promoted **label columns**, **projection pushdown**,
 > **structured metadata**, the `loki_labels` / `loki_label_values` / `loki_series` discovery
 > helpers, **secrets-based auth**, **automatic paging** over Loki's per-request cap, and
-> **`ATTACH`** — Loki as a read-only attached database. Targets DuckDB **v1.5.5**. Still to
+> **`ATTACH`** — Loki as a read-only attached database. Targets DuckDB **v2.0.0**. Still to
 > come: the community-extensions submission. See [`DESIGN.md`](./DESIGN.md) for the full
 > specification and roadmap.
 
