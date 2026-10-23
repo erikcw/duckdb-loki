@@ -88,7 +88,7 @@ int64_t ValueToEpochNs(const Value &value) {
 	Value as_ts = value.DefaultCastAs(LogicalType::TIMESTAMP);
 	auto ts = as_ts.GetValue<timestamp_t>();
 	int64_t ns;
-	if (!Timestamp::IsFinite(ts) || !Timestamp::TryGetEpochNanoSeconds(ts, ns)) {
+	if (!ts.IsFinite() || !Timestamp::TryGetEpochNanoSeconds(ts, ns)) {
 		throw BinderException("loki: time bound '%s' is outside the range representable in nanoseconds "
 		                      "(1677-09-21 .. 2262-04-11)",
 		                      as_ts.ToString());
@@ -157,8 +157,8 @@ void ResolveLokiConnection(ClientContext &context, TableFunctionBindInput &input
 		// sorts first).
 		auto match = secret_manager.LookupSecret(transaction, inline_endpoint, "loki");
 		if (match.HasMatch()) {
-			ReadLokiSecret(RequireLokiSecret(match.GetSecret(), match.GetSecret().GetName(), fn), endpoint, auth,
-			               secret_headers);
+			ReadLokiSecret(RequireLokiSecret(match.GetSecret(), match.GetSecret().GetName().GetIdentifierName(), fn),
+			               endpoint, auth, secret_headers);
 		}
 	}
 
@@ -257,8 +257,8 @@ void ResolveLokiConnectionFromOptions(ClientContext &context, const std::string 
 		// C++17 if-init statement — DuckDB's extension build is C++11 and CI rejects the extension.)
 		auto match = secret_manager.LookupSecret(transaction, inline_endpoint, "loki");
 		if (match.HasMatch()) {
-			ReadLokiSecret(RequireLokiSecret(match.GetSecret(), match.GetSecret().GetName(), fn), endpoint, auth,
-			               secret_headers);
+			ReadLokiSecret(RequireLokiSecret(match.GetSecret(), match.GetSecret().GetName().GetIdentifierName(), fn),
+			               endpoint, auth, secret_headers);
 		}
 	}
 
