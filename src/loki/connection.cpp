@@ -153,8 +153,7 @@ void ResolveLokiConnection(ClientContext &context, TableFunctionBindInput &input
 	} else {
 		// No explicit secret: fall back to the best-matching `loki` secret for this endpoint. DuckDB
 		// names an unnamed CREATE SECRET (TYPE loki, ...) `__default_loki`, and empty-scope secrets
-		// match any path at the lowest score, tie-breaking toward the default (leading underscore
-		// sorts first).
+		// match any path at the lowest score; ties go to the name that sorts first, upper-cased.
 		auto match = secret_manager.LookupSecret(transaction, inline_endpoint, "loki");
 		if (match.HasMatch()) {
 			ReadLokiSecret(RequireLokiSecret(match.GetSecret(), match.GetSecret().GetName().GetIdentifierName(), fn),
